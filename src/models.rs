@@ -8,26 +8,6 @@ use ton_abi::{Function, Token, TokenValue, Uint};
 use ton_block::{AccountStuff, MsgAddressInt};
 use ton_types::{BuilderData, Cell};
 
-#[derive(Debug, Clone, PackAbiPlain)]
-pub struct DexPairV9BuildExchangePayloadV2 {
-    #[abi(name = "_id", uint64)]
-    pub id: u64,
-    #[abi(name = "_deployWalletGrams", uint128)]
-    pub deploy_wallet_grams: u128,
-    #[abi(name = "_expectedAmount", uint128)]
-    pub expected_amount: u128,
-    #[abi(name = "_recipient", address)]
-    pub recipient: MsgAddressInt,
-    #[abi(name = "_referrer", address)]
-    pub referrer: MsgAddressInt,
-    #[abi(name = "_successPayload")]
-    pub success_payload: Option<ton_types::Cell>,
-    #[abi(name = "_cancelPayload")]
-    pub cancel_payload: Option<ton_types::Cell>,
-    #[abi(name = "_toNative")]
-    pub to_native: Option<bool>,
-}
-
 #[derive(PackAbiPlain, UnpackAbiPlain, Debug, Clone)]
 pub struct Transfer {
     #[abi]

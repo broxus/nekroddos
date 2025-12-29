@@ -2,6 +2,7 @@ pub mod combined_plot;
 pub mod plotting;
 
 use crate::models::GenericDeploymentInfo;
+use crate::stream;
 use crate::{send, Args};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -12,6 +13,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::broadcast;
 
 #[derive(Parser, Debug, Clone)]
 pub struct LatencyTestArgs {
@@ -50,6 +52,8 @@ pub(crate) async fn run(
     client: RpcClient,
 ) -> Result<()> {
     const COST_PER_TRANSACTION: u64 = 8_857_001;
+
+    stream::init(client.clone(), common_args.endpoints.clone()).await?;
 
     let base_deployments_path = common_args.project_root.join("deployments");
     let network_deployments_path = if let Some(network_name) = &common_args.network {
@@ -218,6 +222,10 @@ async fn send_test_transaction(
     let balance = state.account.storage.balance.grams.as_u128();
     log::info!("Sender balance: {}", balance);
     let prev_lt = state.account.storage.last_trans_lt;
+    let sender = sender.clone();
+    let address = sender.to_string();
+    let stream = stream::global()?;
+    let mut updates = stream.subscribe_addr(&address).await?;
 
     send::send(
         client,
@@ -230,13 +238,19 @@ async fn send_test_transaction(
     )
     .await?;
 
-    // Wait for the transaction to be included in the block
     loop {
-        let state = client.get_contract_state(sender, None).await?.unwrap();
-        if state.account.storage.last_trans_lt != prev_lt {
-            break;
+        match updates.recv().await {
+            Ok(update) => {
+                let _ = (update.gen_utime, update.dropped);
+                if update.address == address && update.max_lt != prev_lt {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => {
+                return Err(anyhow::anyhow!("stream updates channel closed"));
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     Ok(())

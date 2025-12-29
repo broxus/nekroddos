@@ -277,7 +277,7 @@ fn print_histogram(histogram: &Histogram) -> Option<()> {
         25_000_000_000, // 25s
     ];
 
-    let count_sum = histogram.into_iter().map(|x| x.count() as u64).sum::<u64>();
+    let count_sum = histogram.into_iter().map(|x| x.count()).sum::<u64>();
 
     let max_duration_len: usize = interesting_times_in_ns
         .iter()
@@ -295,7 +295,7 @@ fn print_histogram(histogram: &Histogram) -> Option<()> {
         let count_between = histogram
             .into_iter()
             .filter(|x| x.start() > low && x.start() < high)
-            .map(|x| x.count() as u64)
+            .map(|x| x.count())
             .sum::<u64>();
         let between_percent = if count_sum > 0 {
             count_between * 100 / count_sum
@@ -303,7 +303,7 @@ fn print_histogram(histogram: &Histogram) -> Option<()> {
             0
         };
         let num_stars = between_percent / 2; // 2% per star
-        let pattern: String = std::iter::repeat("*").take(num_stars as usize).collect();
+        let pattern = "*".repeat(num_stars as usize);
         let high_duration = humantime::format_duration(Duration::from_nanos(high)).to_string();
         let high_duration = format!("{:width$}", high_duration, width = max_duration_len);
 

@@ -16,6 +16,7 @@ mod build_payload;
 pub mod latency;
 mod models;
 mod send;
+mod stream;
 
 mod rand_send;
 
