@@ -48,6 +48,9 @@ pub(crate) struct Args {
     #[clap(short, long)]
     no_wait: bool,
 
+    #[clap(long)]
+    no_stream: bool,
+
     /// Which timediff makes the node dead
     #[clap(long = "dead-seconds", default_value = "120")]
     node_is_dead_seconds: u64,
@@ -76,9 +79,11 @@ pub async fn run_test() -> Result<()> {
         .context("Failed to load .env file")?;
 
     let seed = dotenvy::var("BROXUS_PHRASE").context("SEED is not set")?;
-    let keypair =
-        nekoton::crypto::derive_from_phrase(&seed, nekoton::crypto::MnemonicType::Labs(0))
-            .context("Failed to derive keypair")?;
+    let keypair = nekoton::crypto::derive_from_phrase(
+        &seed,
+        nekoton::crypto::MnemonicType::Bip39(nekoton::crypto::Bip39MnemonicData::labs_old(0)),
+    )
+    .context("Failed to derive keypair")?;
     let keypair = Arc::new(keypair);
     let client = RpcClient::new(
         app_args.endpoints.clone(),

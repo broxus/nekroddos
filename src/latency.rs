@@ -53,7 +53,12 @@ pub(crate) async fn run(
 ) -> Result<()> {
     const COST_PER_TRANSACTION: u64 = 8_857_001;
 
-    stream::init(client.clone(), common_args.endpoints.clone()).await?;
+    stream::init(
+        client.clone(),
+        common_args.endpoints.clone(),
+        common_args.no_stream,
+    )
+    .await?;
 
     let base_deployments_path = common_args.project_root.join("deployments");
     let network_deployments_path = if let Some(network_name) = &common_args.network {

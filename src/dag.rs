@@ -201,7 +201,7 @@ async fn get_wallets(
             "nonce",
             TokenValue::Uint(Uint::new(i as u128, 256)),
         )];
-        let result = method.run_local(&SimpleClock, state.account.clone(), &tokens)?;
+        let result = method.run_local(&SimpleClock, state.account.clone(), &tokens, &[])?;
         let tokens = result.tokens.context("No tokens")?;
         let addr: Output = tokens.unpack()?;
         recipients.push(addr.reciever);

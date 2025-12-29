@@ -1,4 +1,5 @@
 use once_cell::sync::OnceCell;
+use std::io::Cursor;
 use ton_abi::Contract;
 macro_rules! declare_abi {
     ($($contract:ident => $source:literal),*$(,)?) => {$(
@@ -16,7 +17,7 @@ trait OnceCellExt {
 
 impl OnceCellExt for OnceCell<Contract> {
     fn load(&self, data: &str) -> &Contract {
-        self.get_or_init(|| Contract::load(data).expect("Trust me"))
+        self.get_or_init(|| Contract::load(Cursor::new(data)).expect("Trust me"))
     }
 }
 

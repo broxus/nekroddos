@@ -87,6 +87,7 @@ impl AppCache {
                 &SimpleClock,
                 account.clone(),
                 &answer_id,
+                &[],
             ) {
                 let token_roots: GetTokenRoots = token_pair.tokens.unwrap().unpack().unwrap();
                 tokens.insert(token_roots.left.clone());

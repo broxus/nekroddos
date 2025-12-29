@@ -131,6 +131,7 @@ fn get_wallet_of(
                 ),
                 Token::new("walletOwner", recipient.clone().token_value()),
             ],
+            &[],
         )
         .unwrap()
         .tokens
@@ -229,6 +230,6 @@ pub struct StatsFunctionOutput {
 pub fn get_stats(state: AccountStuff) -> StatsFunctionOutput {
     let abi = receiver();
     let method = abi.function("stats").unwrap();
-    let res = method.run_local(&SimpleClock, state, &[]).unwrap();
+    let res = method.run_local(&SimpleClock, state, &[], &[]).unwrap();
     res.tokens.unwrap().unpack().unwrap()
 }

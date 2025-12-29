@@ -228,7 +228,7 @@ async fn get_wallets(
             public_key: UInt256::from(pubkey),
         }
         .pack();
-        let result = method.run_local(&SimpleClock, state.account.clone(), &tokens)?;
+        let result = method.run_local(&SimpleClock, state.account.clone(), &tokens, &[])?;
         let tokens = result.tokens.context("No tokens")?;
         let addr: GetWalletFunctionOutput = tokens.unpack()?;
         recipients.push(addr.receiver);
@@ -236,4 +236,3 @@ async fn get_wallets(
 
     Ok(recipients)
 }
-

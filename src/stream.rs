@@ -117,10 +117,22 @@ pub(crate) async fn supports_streaming(client: &RpcClient) -> Result<bool> {
     Ok(has_streaming)
 }
 
-pub(crate) async fn init(client: RpcClient, endpoints: Vec<Url>) -> Result<Arc<StreamHandle>> {
-    let streaming = supports_streaming(&client).await?;
+pub(crate) async fn init(
+    client: RpcClient,
+    endpoints: Vec<Url>,
+    no_stream: bool,
+) -> Result<Arc<StreamHandle>> {
+    let streaming = if no_stream {
+        false
+    } else {
+        supports_streaming(&client).await?
+    };
     if !streaming {
-        log::info!("Streaming is not supported, using polling");
+        if no_stream {
+            log::info!("Streaming disabled, using polling");
+        } else {
+            log::info!("Streaming is not supported, using polling");
+        }
     }
 
     let poll = if streaming {
@@ -150,7 +162,18 @@ impl StreamHandle {
             .into_iter()
             .next()
             .context("no endpoints provided")?;
-        let stream = rpc.join("stream").context("failed to build stream url")?;
+        let mut stream = rpc.clone();
+        let mut base_path = stream.path().trim_end_matches('/').to_owned();
+        if let Some(stripped) = base_path.strip_suffix("/rpc") {
+            base_path = stripped.to_owned();
+        }
+        let base_path = base_path.trim_end_matches('/');
+        let stream_path = if base_path.is_empty() {
+            "/stream".to_string()
+        } else {
+            format!("{base_path}/stream")
+        };
+        stream.set_path(&stream_path);
         let http = reqwest::Client::builder().build()?;
         let (updates_tx, _) = broadcast::channel(1024);
         let handle = Arc::new(Self {
@@ -368,12 +391,20 @@ impl StreamHandle {
     async fn handle_event(&self, name: &str, data: &str) -> Result<()> {
         match name {
             "uuid" => {
+                log::info!("Stream event uuid: {data}");
                 *self.uuid.write() = data.to_owned();
                 self.uuid_notify.notify_waiters();
                 self.resubscribe_all(data).await?;
             }
             "update" => {
                 let payload: UpdatePayload = serde_json::from_str(data)?;
+                log::info!(
+                    "Stream event update address={} max_lt={} gen_utime={} dropped={:?}",
+                    payload.address,
+                    payload.max_lt,
+                    payload.gen_utime,
+                    payload.dropped
+                );
                 let update = StreamUpdate {
                     address: payload.address,
                     max_lt: payload.max_lt,

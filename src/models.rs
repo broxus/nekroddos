@@ -156,6 +156,7 @@ impl PayloadGenerator {
                 &SimpleClock,
                 self.first_pool_state.clone(),
                 &self.tokens.swap,
+                &[],
             )
             .map_err(|x| {
                 log::error!("run_local error {:#?}", x);
