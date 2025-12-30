@@ -9,6 +9,7 @@ use clap::Parser;
 use ed25519_dalek::Keypair;
 use everscale_rpc_client::RpcClient;
 use governor::RateLimiter;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -22,8 +23,12 @@ pub struct LatencyTestArgs {
     num_txs: usize,
 
     #[clap(short, long)]
-    /// Transactions per second
-    rps: u32,
+    /// Transactions per second (optional)
+    rps: Option<u32>,
+
+    #[clap(long, value_name = "MS")]
+    /// Period in milliseconds for random sleep before each send (uniform 0..period)
+    period: Option<u64>,
 
     #[clap(short, long, default_value = "1000000")]
     /// Amount to send in nanotons
@@ -107,11 +112,21 @@ pub(crate) async fn run(
     let required_balance = COST_PER_TRANSACTION * latency_args.num_txs as u64;
     let max_iterations = initial_balance / COST_PER_TRANSACTION as u128;
 
-    log::info!(
-        "Starting latency test - sending {} transactions at {} TPS",
-        latency_args.num_txs,
-        latency_args.rps
-    );
+    match latency_args.rps {
+        Some(rps) => {
+            log::info!(
+                "Starting latency test - sending {} transactions at {} TPS",
+                latency_args.num_txs,
+                rps
+            );
+        }
+        None => {
+            log::info!(
+                "Starting latency test - sending {} transactions with no rate limit",
+                latency_args.num_txs
+            );
+        }
+    }
     log::info!(
         "Initial balance: {}, required balance: {}, max iterations: {}",
         initial_balance,
@@ -119,9 +134,18 @@ pub(crate) async fn run(
         max_iterations
     );
 
-    let rl = RateLimiter::direct(governor::Quota::per_second(
-        std::num::NonZeroU32::new(latency_args.rps).unwrap(),
-    ));
+    let period = latency_args.period.filter(|value| *value > 0);
+    if let Some(period) = period {
+        log::warn!("Latency period enabled: sleeping 0..{period}ms before each send");
+    }
+
+    let rl = match latency_args.rps {
+        Some(rps) => {
+            let rps = std::num::NonZeroU32::new(rps).context("rps must be > 0")?;
+            Some(RateLimiter::direct(governor::Quota::per_second(rps)))
+        }
+        None => None,
+    };
 
     let mut csv_writer = if let Some(csv_path) = &latency_args.csv {
         let mut writer = std::fs::File::create(csv_path)?;
@@ -130,6 +154,14 @@ pub(crate) async fn run(
     } else {
         None
     };
+
+    let mut rng = common_args
+        .seed
+        .map(StdRng::seed_from_u64)
+        .unwrap_or_else(StdRng::from_entropy);
+
+    let total_iterations = std::cmp::min(latency_args.num_txs, max_iterations as usize);
+    let test_start = Instant::now();
 
     let mut latencies = Vec::with_capacity(latency_args.num_txs);
     let mut timestamped_latencies = Vec::with_capacity(latency_args.num_txs);
@@ -140,8 +172,14 @@ pub(crate) async fn run(
         "0:0000000000000000000000000000000000000000000000000000000000000000",
     )?;
 
-    for i in 0..std::cmp::min(latency_args.num_txs, max_iterations as usize) {
-        rl.until_ready().await;
+    for i in 0..total_iterations {
+        if let Some(rl) = &rl {
+            rl.until_ready().await;
+        }
+        if let Some(period) = period {
+            let delay = rng.gen_range(0..period);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
 
         let start = Instant::now();
         let ts = SystemTime::now();
@@ -167,6 +205,15 @@ pub(crate) async fn run(
                 error_count += 1;
                 log::error!("Transaction {} failed: {}", i, e);
             }
+        }
+
+        let completed = i + 1;
+        if completed % 2 == 0 && completed < total_iterations {
+            let elapsed_secs = test_start.elapsed().as_secs_f64();
+            let avg_secs = elapsed_secs / completed as f64;
+            let remaining_secs = avg_secs * (total_iterations - completed) as f64;
+            let remaining_mins = remaining_secs / 60.0;
+            log::info!("Estimated time remaining: {:.1} min", remaining_mins);
         }
     }
 
@@ -244,16 +291,19 @@ async fn send_test_transaction(
     .await?;
 
     loop {
-        match updates.recv().await {
-            Ok(update) => {
+        match tokio::time::timeout(Duration::from_secs(60), updates.recv()).await {
+            Ok(Ok(update)) => {
                 let _ = (update.gen_utime, update.dropped);
-                if update.address == address && update.max_lt != prev_lt {
+                if update.address == address && update.max_lt > prev_lt {
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => {
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
                 return Err(anyhow::anyhow!("stream updates channel closed"));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!("timeout waiting for stream update"));
             }
         }
     }
