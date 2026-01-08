@@ -209,7 +209,7 @@ async fn send_forward_and_backward(
         meta: PayloadMeta,
         state: Arc<AccountStuff>,
     ) -> Result<()> {
-        send::send(
+        let outcome = send::send(
             &client,
             &payload.signer,
             payload.sender_addr.clone(),
@@ -218,7 +218,9 @@ async fn send_forward_and_backward(
             3_000_000_000,
             &state,
         )
-        .await
+        .await?;
+        outcome.broadcast_result?;
+        Ok(())
     }
 
     async fn process_transaction(

@@ -192,7 +192,7 @@ async fn ddos_job(
             let state = state.clone();
 
             tokio::spawn(async move {
-                send::send(
+                let outcome = send::send(
                     &client,
                     &signer,
                     from,
@@ -203,6 +203,7 @@ async fn ddos_job(
                 )
                 .await
                 .unwrap();
+                outcome.broadcast_result.unwrap();
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             })
         };

@@ -180,7 +180,7 @@ async fn ddos_job(
 
             tokio::spawn(async move {
                 let addr_str = rand_dst.to_string();
-                send::send(
+                let outcome = send::send(
                     &client,
                     &signer,
                     from,
@@ -191,6 +191,7 @@ async fn ddos_job(
                 )
                 .await
                 .unwrap();
+                outcome.broadcast_result.unwrap();
                 let _ = tx.send(addr_str);
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             })

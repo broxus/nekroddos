@@ -6,6 +6,11 @@ use ton_abi::sign_with_signature_id;
 use ton_block::{AccountStuff, GlobalCapabilities, MsgAddressInt};
 use ton_types::{BuilderData, SliceData};
 
+pub struct SendOutcome {
+    pub message: ton_block::Message,
+    pub broadcast_result: anyhow::Result<()>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send(
     client: &everscale_rpc_client::RpcClient,
@@ -15,7 +20,7 @@ pub async fn send(
     destination: MsgAddressInt,
     amount: u64,
     state: &AccountStuff,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SendOutcome> {
     use tokio::sync::OnceCell;
 
     static SIGN_ID: OnceCell<Option<i32>> = OnceCell::const_new();
@@ -61,7 +66,13 @@ pub async fn send(
     let signature = sign_with_signature_id(signer, message.hash(), *sign_id);
     let signed_message = message.sign(&signature.to_bytes()).unwrap().message;
 
-    client.broadcast_message(signed_message).await?;
+    let broadcast_result = client
+        .broadcast_message(signed_message.clone())
+        .await
+        .map_err(Into::into);
 
-    Ok(())
+    Ok(SendOutcome {
+        message: signed_message,
+        broadcast_result,
+    })
 }

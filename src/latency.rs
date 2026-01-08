@@ -5,6 +5,7 @@ use crate::models::GenericDeploymentInfo;
 use crate::stream;
 use crate::{send, Args};
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::Parser;
 use ed25519_dalek::Keypair;
 use everscale_rpc_client::RpcClient;
@@ -36,6 +37,10 @@ pub struct LatencyTestArgs {
 
     #[clap(short, long)]
     csv: Option<PathBuf>,
+
+    #[clap(long, value_name = "PATH")]
+    /// Path to log CSV with blake3 hash, repr hash, timestamp, and loss flag
+    log_file: Option<PathBuf>,
 
     #[clap(long, value_name = "PATH")]
     /// Path to save interactive HTML plot (if specified, plot will be generated)
@@ -155,6 +160,14 @@ pub(crate) async fn run(
         None
     };
 
+    let mut log_writer = if let Some(log_path) = &latency_args.log_file {
+        let mut writer = std::fs::File::create(log_path)?;
+        writeln!(writer, "blake3_hash,repr_hash,timestamp,lost")?;
+        Some(writer)
+    } else {
+        None
+    };
+
     let mut rng = common_args
         .seed
         .map(StdRng::seed_from_u64)
@@ -184,7 +197,15 @@ pub(crate) async fn run(
         let start = Instant::now();
         let ts = SystemTime::now();
 
-        match send_test_transaction(&client, keypair, &sender, &receiver, latency_args.amount).await
+        match send_test_transaction(
+            &client,
+            keypair,
+            &sender,
+            &receiver,
+            latency_args.amount,
+            &mut log_writer,
+        )
+        .await
         {
             Ok(_) => {
                 let latency = start.elapsed();
@@ -262,12 +283,34 @@ pub(crate) async fn run(
     Ok(())
 }
 
+struct LogData {
+    hash: String,
+    repr: String,
+    ts: String,
+}
+
+impl LogData {
+    fn write(&self, writer: &mut std::fs::File, lost: bool) -> Result<()> {
+        writeln!(
+            writer,
+            "{hash},{repr},{ts},{lost}",
+            hash = self.hash.as_str(),
+            repr = self.repr.as_str(),
+            ts = self.ts.as_str(),
+            lost = lost,
+        )?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
 async fn send_test_transaction(
     client: &RpcClient,
     keypair: &Keypair,
     sender: &ton_block::MsgAddressInt,
     receiver: &ton_block::MsgAddressInt,
     amount: u64,
+    log_writer: &mut Option<std::fs::File>,
 ) -> Result<()> {
     let payload = ton_types::BuilderData::new();
     let state = client.get_contract_state(sender, None).await?.unwrap();
@@ -279,7 +322,7 @@ async fn send_test_transaction(
     let stream = stream::global()?;
     let mut updates = stream.subscribe_addr(&address).await?;
 
-    send::send(
+    let outcome = send::send(
         client,
         keypair,
         sender.clone(),
@@ -290,19 +333,47 @@ async fn send_test_transaction(
     )
     .await?;
 
+    let log_data = if log_writer.is_some() {
+        let ts = Utc::now().to_rfc3339();
+        let cell = ton_block::Serializable::write_to_new_cell(&outcome.message)
+            .and_then(ton_types::BuilderData::into_cell)?;
+        let boc = ton_types::serialize_toc(&cell)?;
+        let hash = blake3::hash(&boc).to_hex().to_string();
+        let repr = hex::encode(cell.repr_hash().inner());
+        Some(LogData { hash, repr, ts })
+    } else {
+        None
+    };
+
+    if let Err(err) = outcome.broadcast_result {
+        if let (Some(log_data), Some(writer)) = (log_data.as_ref(), log_writer.as_mut()) {
+            log_data.write(writer, true)?;
+        }
+        return Err(err);
+    }
+
     loop {
         match tokio::time::timeout(Duration::from_secs(60), updates.recv()).await {
             Ok(Ok(update)) => {
                 let _ = (update.gen_utime, update.dropped);
                 if update.address == address && update.max_lt > prev_lt {
+                    if let Some(log_data) = log_data.as_ref() {
+                        log_data.write(log_writer.as_mut().unwrap(), false)?;
+                    }
                     break;
                 }
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => {
+                if let (Some(log_data), Some(writer)) = (log_data.as_ref(), log_writer.as_mut()) {
+                    log_data.write(writer, true)?;
+                }
                 return Err(anyhow::anyhow!("stream updates channel closed"));
             }
             Err(_) => {
+                if let (Some(log_data), Some(writer)) = (log_data.as_ref(), log_writer.as_mut()) {
+                    log_data.write(writer, true)?;
+                }
                 return Err(anyhow::anyhow!("timeout waiting for stream update"));
             }
         }
