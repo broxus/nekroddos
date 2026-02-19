@@ -28,19 +28,19 @@ pub struct RandSendTestArgs {
     #[clap(short, long)]
     total_wallets: u32,
     #[clap(short, long)]
-    rps: u32,
+    pub(crate) rps: u32,
 
     #[clap(short, long)]
     num_seconds: u32,
 
     #[clap(short, long)]
-    from_rps: u32,
+    pub(crate) from_rps: u32,
 
     #[clap(short, long)]
-    to_rps: u32,
-    
+    pub(crate) to_rps: u32,
+
     #[clap(long)]
-    save_accounts: Option<std::path::PathBuf>,
+    pub(crate) save_accounts: Option<std::path::PathBuf>,
 }
 
 pub async fn run(
@@ -77,9 +77,36 @@ pub async fn run(
     .context("Failed to get wallets")?;
     recievers.sort();
 
+    let recievers: Vec<_> = recievers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, receiver)| {
+            crate::util::belongs_to_worker(
+                index,
+                common_args.worker_index,
+                common_args.workers_total,
+            )
+            .then_some(receiver)
+        })
+        .collect();
+    if recievers.is_empty() {
+        log::warn!(
+            "Worker {}/{} has no sender wallets assigned",
+            common_args.worker_index,
+            common_args.workers_total
+        );
+        return Ok(());
+    }
     if let Some(path) = &swap_args.save_accounts {
-        save_accounts_to_file(&recievers, path)?;
-        log::info!("Saved {} accounts to {:?}", recievers.len(), path);
+        if let Some(shared_tx) = common_args.shared_output_tx.clone() {
+            for account in &recievers {
+                let _ = shared_tx.send(format!("{account}"));
+            }
+            log::info!("Queued {} accounts for shared output", recievers.len());
+        } else {
+            save_accounts_to_file(&recievers, path)?;
+            log::info!("Saved {} accounts to {:?}", recievers.len(), path);
+        }
     }
 
     spawn_ddos_jobs(&swap_args, client, recievers, common_args, key_pair).await?;

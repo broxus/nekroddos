@@ -64,8 +64,11 @@ impl TestEnv {
         })
     }
 
-    pub fn set_counter(&self, value: u64) {
-        self.counter
-            .store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn belongs_to_worker(index: usize, worker_index: usize, workers_total: usize) -> bool {
+    if workers_total <= 1 {
+        return true;
     }
+    index % workers_total == worker_index
 }

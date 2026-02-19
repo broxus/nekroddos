@@ -12,11 +12,11 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let mut rng = rand::thread_rng();
-    
+
     // Create bimodal distribution: 70% around 500ms, 30% around 3500ms
     let normal_fast = Normal::new(500.0, 100.0).unwrap();
     let normal_slow = Normal::new(3500.0, 200.0).unwrap();
-    
+
     let mut latencies = Vec::new();
     for _ in 0..1000 {
         let latency: f64 = if rng.gen_bool(0.7) {
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
             // Slow mode: centered around 3500ms
             normal_slow.sample(&mut rng)
         };
-        
+
         let latency = latency.clamp(100.0, 5000.0);
         latencies.push(Duration::from_millis(latency as u64));
     }
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         .unwrap()
         .as_secs()
         - 3600;
-    
+
     let timestamped_latencies: Vec<plotting::TimestampedLatency> = latencies
         .iter()
         .enumerate()
@@ -71,14 +71,14 @@ fn main() -> Result<()> {
             plotting::TimestampedLatency { timestamp, latency }
         })
         .collect();
-    
+
     let combined_path = PathBuf::from("demo_combined_plots.html");
     plotting::generate_combined_plots(
         &latencies,
         &timestamped_latencies,
         combined_path.clone(),
         &stats,
-        None,  // Auto-calculate optimal window based on data
+        None, // Auto-calculate optimal window based on data
         Some(1000.0),
     )?;
     println!("\nCombined plot saved to: {combined_path:?}");

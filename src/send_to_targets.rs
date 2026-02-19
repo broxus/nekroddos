@@ -1,6 +1,6 @@
 use crate::abi::{get_wallet, GetWalletFunctionInput, GetWalletFunctionOutput};
 use crate::models::GenericDeploymentInfo;
-use crate::util::TestEnv;
+use crate::util::{belongs_to_worker, TestEnv};
 use crate::{send, Args};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -24,7 +24,7 @@ pub struct SendToTargetsArgs {
     #[clap(short, long)]
     total_wallets: u32,
     #[clap(short, long)]
-    rps: u32,
+    pub(crate) rps: u32,
     #[clap(short, long)]
     num_iterations: u32,
     #[clap(short, long)]
@@ -82,6 +82,22 @@ pub async fn run(
     )
     .await
     .context("Failed to get sender wallets")?;
+    let sender_wallets: Vec<_> = sender_wallets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, sender)| {
+            belongs_to_worker(index, common_args.worker_index, common_args.workers_total)
+                .then_some(sender)
+        })
+        .collect();
+    if sender_wallets.is_empty() {
+        log::warn!(
+            "Worker {}/{} has no sender wallets assigned",
+            common_args.worker_index,
+            common_args.workers_total
+        );
+        return Ok(());
+    }
     log::info!("Deployed {} sender wallets", sender_wallets.len());
 
     // Read target addresses from file
@@ -92,29 +108,39 @@ pub async fn run(
     log::info!("Loaded {} target addresses", target_addresses.len());
 
     // Run the DDoS jobs
-    spawn_ddos_jobs(&args, client, sender_wallets, target_addresses, common_args, key_pair).await?;
+    spawn_ddos_jobs(
+        &args,
+        client,
+        sender_wallets,
+        target_addresses,
+        common_args,
+        key_pair,
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn read_targets(path: &PathBuf) -> Result<Vec<MsgAddressInt>> {
-    let file = File::open(path).await.context("Failed to open targets file")?;
+    let file = File::open(path)
+        .await
+        .context("Failed to open targets file")?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
-    
+
     let mut targets = Vec::new();
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        
+
         match line.parse::<MsgAddressInt>() {
             Ok(addr) => targets.push(addr),
             Err(e) => log::warn!("Failed to parse address '{}': {}", line, e),
         }
     }
-    
+
     Ok(targets)
 }
 
@@ -135,7 +161,10 @@ async fn spawn_ddos_jobs(
         common_args.clone(),
     );
 
-    log::info!("Spawning ddos jobs for {} sender wallets", sender_wallets.len());
+    log::info!(
+        "Spawning ddos jobs for {} sender wallets",
+        sender_wallets.len()
+    );
     let target_addresses = Arc::new(target_addresses);
 
     let mut rng = StdRng::seed_from_u64(test_env.seed.unwrap_or_else(rand::random));

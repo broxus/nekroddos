@@ -1,7 +1,7 @@
+use crate::latency::plotting::LatencyStats;
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use crate::latency::plotting::LatencyStats;
 
 pub fn generate_combined_html(
     density_chart_option: &str,

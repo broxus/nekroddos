@@ -1,13 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::dag::DagTestArgs;
 use crate::send_tokens::SendTestArgs;
 use crate::swap::SwapTestArgs;
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use everscale_rpc_client::{ClientOptions, ReliabilityParams, RpcClient};
+use clap::{Parser, Subcommand, ValueEnum};
 use url::Url;
 
 mod abi;
@@ -22,6 +20,7 @@ mod rand_send;
 
 mod dag;
 mod dos;
+mod execution;
 mod send_to_targets;
 mod send_tokens;
 mod swap;
@@ -58,6 +57,23 @@ pub(crate) struct Args {
     /// Select the network-specific deployment directory under <project_root>/deployments/
     #[clap(long)]
     network: Option<String>,
+
+    #[clap(long, value_enum, default_value_t = EndpointMode::Rr)]
+    endpoint_mode: EndpointMode,
+
+    // Runtime-internal worker shard metadata (not user-facing CLI params).
+    #[clap(skip = 0usize)]
+    worker_index: usize,
+    #[clap(skip = 1usize)]
+    workers_total: usize,
+    #[clap(skip = None)]
+    shared_output_tx: Option<std::sync::mpsc::Sender<String>>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum EndpointMode {
+    Rr,
+    Distinct,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -73,10 +89,9 @@ enum Commands {
 
 pub async fn run_test() -> Result<()> {
     env_logger::init();
-    let app_args = Args::parse();
+    let args = Args::parse();
 
-    dotenvy::from_filename(app_args.project_root.join(".env"))
-        .context("Failed to load .env file")?;
+    dotenvy::from_filename(args.project_root.join(".env")).context("Failed to load .env file")?;
 
     let seed = dotenvy::var("BROXUS_PHRASE").context("SEED is not set")?;
     let keypair = nekoton::crypto::derive_from_phrase(
@@ -84,44 +99,6 @@ pub async fn run_test() -> Result<()> {
         nekoton::crypto::MnemonicType::Bip39(nekoton::crypto::Bip39MnemonicData::labs_old(0)),
     )
     .context("Failed to derive keypair")?;
-    let keypair = Arc::new(keypair);
-    let client = RpcClient::new(
-        app_args.endpoints.clone(),
-        ClientOptions {
-            request_timeout: Duration::from_secs(60),
-            choose_strategy: everscale_rpc_client::ChooseStrategy::RoundRobin,
-            reliability_params: ReliabilityParams {
-                mc_acceptable_time_diff_sec: app_args.node_is_dead_seconds,
-                sc_acceptable_time_diff_sec: app_args.node_is_dead_seconds,
-            },
-            ..Default::default()
-        },
-    )
-    .await?;
 
-    match &app_args.command {
-        Commands::Swap(args) => {
-            swap::run(args.clone(), app_args, &keypair, client).await?;
-        }
-        Commands::Dag(args) => {
-            dag::run(args.clone(), app_args, client).await?;
-        }
-        Commands::Send(args) => {
-            send_tokens::run(args.clone(), app_args, keypair, client).await?;
-        }
-        Commands::Latency(args) => {
-            latency::run(args.clone(), app_args, &keypair, client).await?;
-        }
-        Commands::RandSend(arg) => {
-            rand_send::run(arg.clone(), app_args, keypair, client).await?;
-        }
-        Commands::SendToTargets(args) => {
-            send_to_targets::run(args.clone(), app_args, keypair, client).await?;
-        }
-        Commands::AccountsDos(args) => {
-            dos::run(args.clone(), app_args, client).await?;
-        }
-    }
-
-    Ok(())
+    execution::Executor::run(args, Arc::new(keypair)).await
 }

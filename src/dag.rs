@@ -1,7 +1,7 @@
 use crate::abi::dudos_factory;
 use crate::build_payload::{get_dag_payload, get_stats};
 use crate::models::GenericDeploymentInfo;
-use crate::util::TestEnv;
+use crate::util::{belongs_to_worker, TestEnv};
 use crate::Args;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -21,7 +21,7 @@ pub struct DagTestArgs {
     #[clap(short, long)]
     total_wallets: u32,
     #[clap(short, long)]
-    rps: u32,
+    pub(crate) rps: u32,
     #[clap(short, long)]
     num_iterations: u32,
 
@@ -69,6 +69,22 @@ pub async fn run(swap_args: DagTestArgs, common_args: Args, client: RpcClient) -
     let recievers = get_wallets(client.clone(), &factory.address, swap_args.total_wallets)
         .await
         .context("Failed to get wallets")?;
+    let recievers: Vec<_> = recievers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, receiver)| {
+            belongs_to_worker(index, common_args.worker_index, common_args.workers_total)
+                .then_some(receiver)
+        })
+        .collect();
+    if recievers.is_empty() {
+        log::warn!(
+            "Worker {}/{} has no receivers assigned",
+            common_args.worker_index,
+            common_args.workers_total
+        );
+        return Ok(());
+    }
 
     spawn_ddos_jobs(&swap_args, client, recievers, common_args).await?;
 
@@ -84,14 +100,17 @@ async fn spawn_ddos_jobs(
     let test_env = TestEnv::new(
         args.num_iterations,
         args.rps,
-        args.total_wallets as usize,
+        recievers.len(),
         client,
         common_args.seed,
         common_args.clone(),
     );
 
     if args.only_stats {
-        test_env.set_counter(args.num_iterations as u64 * recievers.len() as u64);
+        test_env.counter.store(
+            args.num_iterations as u64 * recievers.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         print_stats(recievers, &test_env).await;
         return Ok(());
     }
@@ -100,7 +119,13 @@ async fn spawn_ddos_jobs(
 
     for (receiver_idx, reciever) in recievers.clone().into_iter().enumerate() {
         let env = test_env.clone();
-        tokio::spawn(ddos_job(env, reciever, args.payload_size, args.rand_cell, receiver_idx as u32));
+        tokio::spawn(ddos_job(
+            env,
+            reciever,
+            args.payload_size,
+            args.rand_cell,
+            receiver_idx as u32,
+        ));
     }
     log::info!("All jobs spawned");
 
@@ -152,10 +177,24 @@ async fn print_stats(recievers: Vec<MsgAddressInt>, test_env: &TestEnv) {
     }
 }
 
-async fn ddos_job(test_env: TestEnv, reciever: MsgAddressInt, payload_size: u32, rand_cell: bool, receiver_idx: u32) -> Result<()> {
+async fn ddos_job(
+    test_env: TestEnv,
+    reciever: MsgAddressInt,
+    payload_size: u32,
+    rand_cell: bool,
+    receiver_idx: u32,
+) -> Result<()> {
     let jitter = Jitter::new(Duration::from_millis(1), Duration::from_millis(50));
     for i in 1..=test_env.num_iterations {
-        let payload = get_dag_payload(i, payload_size, test_env.seed, reciever.clone(), rand_cell, receiver_idx);
+        let payload = get_dag_payload(
+            i,
+            payload_size,
+            test_env.seed,
+            reciever.clone(),
+            rand_cell,
+            receiver_idx,
+            test_env.args.worker_index,
+        );
         test_env.rate_limiter.until_ready_with_jitter(jitter).await;
         let h = {
             let client = test_env.client.clone();

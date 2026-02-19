@@ -1,6 +1,6 @@
 use crate::abi::{get_wallet, GetWalletFunctionInput, GetWalletFunctionOutput};
 use crate::models::GenericDeploymentInfo;
-use crate::util::TestEnv;
+use crate::util::{belongs_to_worker, TestEnv};
 use crate::{send, Args};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -14,8 +14,6 @@ use rand::{Rng, SeedableRng};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::UnboundedSender;
 use ton_block::MsgAddressInt;
 use ton_types::{BuilderData, UInt256};
 
@@ -24,7 +22,7 @@ pub struct SendTestArgs {
     #[clap(short, long)]
     total_wallets: u32,
     #[clap(short, long)]
-    rps: u32,
+    pub(crate) rps: u32,
     #[clap(short, long)]
     num_iterations: u32,
 
@@ -32,7 +30,7 @@ pub struct SendTestArgs {
     only_stats: bool,
 
     #[clap(long)]
-    log_file: Option<PathBuf>,
+    pub(crate) log_file: Option<PathBuf>,
 }
 pub async fn run(
     swap_args: SendTestArgs,
@@ -81,16 +79,42 @@ pub async fn run(
     .context("Failed to get wallets")?;
     recievers.sort();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    if let Some(log_file) = swap_args.log_file.clone() {
-        tokio::spawn(async move {
-            let file = tokio::fs::File::create(log_file).await.unwrap();
-            let mut file = tokio::io::BufWriter::new(file);
-            while let Some(addr) = rx.recv().await {
-                file.write_all(addr.as_bytes()).await.unwrap();
-                file.write_all(b"\n").await.unwrap();
-            }
-        });
+    let tx = if let Some(shared_tx) = common_args.shared_output_tx.clone() {
+        shared_tx
+    } else {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        if let Some(log_file) = swap_args.log_file.clone() {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let file = std::fs::File::create(log_file).unwrap();
+                let mut writer = std::io::BufWriter::new(file);
+                while let Ok(addr) = rx.recv() {
+                    writer.write_all(addr.as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                }
+                writer.flush().unwrap();
+            });
+        } else {
+            drop(rx);
+        }
+        tx
+    };
+
+    let recievers: Vec<_> = recievers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, receiver)| {
+            belongs_to_worker(index, common_args.worker_index, common_args.workers_total)
+                .then_some(receiver)
+        })
+        .collect();
+    if recievers.is_empty() {
+        log::warn!(
+            "Worker {}/{} has no sender wallets assigned",
+            common_args.worker_index,
+            common_args.workers_total
+        );
+        return Ok(());
     }
 
     spawn_ddos_jobs(&swap_args, client, recievers, common_args, key_pair, tx).await?;
@@ -104,19 +128,22 @@ async fn spawn_ddos_jobs(
     recievers: Vec<MsgAddressInt>,
     common_args: Args,
     key_pair: Arc<Keypair>,
-    tx: UnboundedSender<String>,
+    tx: std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let test_env = TestEnv::new(
         args.num_iterations,
         args.rps,
-        args.total_wallets as usize,
+        recievers.len(),
         client,
         common_args.seed,
         common_args.clone(),
     );
 
     if args.only_stats {
-        test_env.set_counter(args.num_iterations as u64 * recievers.len() as u64);
+        test_env.counter.store(
+            args.num_iterations as u64 * recievers.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // print_stats(recievers, &test_env).await;
         return Ok(());
     }
@@ -156,7 +183,7 @@ async fn ddos_job(
     wallets: Arc<Vec<MsgAddressInt>>,
     signer: Arc<Keypair>,
     mut rng: StdRng,
-    tx: UnboundedSender<String>,
+    tx: std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let jitter = Jitter::new(Duration::from_millis(1), Duration::from_millis(50));
     let state = test_env

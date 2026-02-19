@@ -14,7 +14,7 @@ use ton_block::AccountStuff;
 use crate::models::{
     EverWalletInfo, GenericDeploymentInfo, PayloadGeneratorsData, PayloadMeta, SendData,
 };
-use crate::util::TestEnv;
+use crate::util::{belongs_to_worker, TestEnv};
 use crate::{app_cache, send, Args};
 
 #[derive(Parser, Debug, Clone)]
@@ -24,7 +24,7 @@ pub struct SwapTestArgs {
     num_swaps: usize,
 
     #[clap(short, long)]
-    rps: u32,
+    pub(crate) rps: u32,
 
     #[clap(short, long, default_value = "5")]
     /// swap depth
@@ -81,6 +81,22 @@ pub async fn run(
         pool_addresses.len()
     );
     recipients.sort();
+    recipients = recipients
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, recipient)| {
+            belongs_to_worker(index, common_args.worker_index, common_args.workers_total)
+                .then_some(recipient)
+        })
+        .collect();
+    if recipients.is_empty() {
+        log::warn!(
+            "Worker {}/{} has no recipients assigned",
+            common_args.worker_index,
+            common_args.workers_total
+        );
+        return Ok(());
+    }
 
     let app_cache = app_cache::AppCache::new(client.clone(), common_args.seed)
         .load_states(pool_addresses)

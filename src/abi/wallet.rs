@@ -1,6 +1,6 @@
 use nekoton_abi::{KnownParamTypePlain, PackAbi, PackAbiPlain, UnpackAbiPlain};
-use ton_types::UInt256;
 use ton_block::MsgAddressInt;
+use ton_types::UInt256;
 
 use super::wallet_factory;
 
