@@ -34,7 +34,8 @@ impl TestEnv {
         let barrier = Arc::new(barrier);
 
         let quota = governor::Quota::per_minute(NonZeroU32::new(rps * 60).unwrap())
-            .allow_burst(NonZeroU32::new(rps / 10).unwrap());
+            // Low-rate runs still need a non-zero burst budget for governor.
+            .allow_burst(burst_size(rps));
 
         let rate_limiter = Arc::new(governor::RateLimiter::direct(quota));
         let counter = Arc::new(AtomicU64::new(0));
@@ -66,9 +67,32 @@ impl TestEnv {
 
 }
 
+fn burst_size(rps: u32) -> NonZeroU32 {
+    NonZeroU32::new((rps / 10).max(1)).unwrap()
+}
+
 pub fn belongs_to_worker(index: usize, worker_index: usize, workers_total: usize) -> bool {
     if workers_total <= 1 {
         return true;
     }
     index % workers_total == worker_index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn burst_size_is_clamped_for_low_rps() {
+        assert_eq!(burst_size(1).get(), 1);
+        assert_eq!(burst_size(5).get(), 1);
+        assert_eq!(burst_size(9).get(), 1);
+    }
+
+    #[test]
+    fn burst_size_matches_existing_formula_above_threshold() {
+        assert_eq!(burst_size(10).get(), 1);
+        assert_eq!(burst_size(20).get(), 2);
+        assert_eq!(burst_size(55).get(), 5);
+    }
 }
