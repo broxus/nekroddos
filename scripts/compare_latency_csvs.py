@@ -32,6 +32,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment-specific
 METRICS = ("mean", "p50", "p95", "p99", "max")
 PALETTE = ["#0f766e", "#2563eb", "#dc2626", "#9333ea", "#ea580c", "#0891b2"]
 ROLLING_MEDIAN_WINDOW = 51
+HISTOGRAM_BINS = 64
 
 
 @dataclass(frozen=True)
@@ -390,6 +391,95 @@ def build_points_chart(items: list[Summary], colors: dict[Path, str], baseline: 
     return save_svg(fig)
 
 
+def build_histogram_chart(
+    baseline: Summary,
+    challenger: Summary,
+    colors: dict[Path, str],
+    mode: str,
+) -> str:
+    fig, ax = plt.subplots(figsize=(10.8, 4.8))
+    fig.patch.set_facecolor("#f4efe7")
+    fig.subplots_adjust(top=0.84, bottom=0.18, left=0.11, right=0.98)
+    ax.set_facecolor("#fffdf8")
+
+    min_latency = min(float(baseline.raw_latencies_ms.min()), float(challenger.raw_latencies_ms.min()))
+    max_latency = max(float(baseline.raw_latencies_ms.max()), float(challenger.raw_latencies_ms.max()))
+    if math.isclose(min_latency, max_latency):
+        max_latency = min_latency + 1.0
+    bins = np.linspace(min_latency, max_latency, HISTOGRAM_BINS + 1)
+
+    series: list[tuple[Summary, str]]
+    if mode == "overlay":
+        series = [(baseline, colors[baseline.path]), (challenger, colors[challenger.path])]
+    elif mode == "baseline":
+        series = [(baseline, colors[baseline.path])]
+    elif mode == "challenger":
+        series = [(challenger, colors[challenger.path])]
+    else:  # pragma: no cover - internal contract
+        raise ValueError(f"unknown histogram mode: {mode}")
+
+    for item, color in series:
+        ax.hist(
+            item.raw_latencies_ms,
+            bins=bins,
+            density=True,
+            color=color,
+            alpha=0.34 if mode == "overlay" else 0.55,
+            edgecolor=color,
+            linewidth=1.1,
+            label=item.label,
+        )
+
+    subtitle = {
+        "overlay": "Overlayed density histogram in milliseconds.",
+        "baseline": f"Baseline only: {baseline.label}.",
+        "challenger": f"Challenger only: {challenger.label}.",
+    }[mode]
+    fig.text(0.11, 0.94, "Latency Histogram", fontsize=16, color="#1f2937", weight="bold")
+    fig.text(0.11, 0.912, subtitle, fontsize=10, color="#5b6472")
+    ax.set_xlabel("Latency (ms)", color="#364152")
+    ax.set_ylabel("Density", color="#364152")
+    ax.grid(True, axis="y", color="#dfd7ca", linewidth=0.8, alpha=0.7)
+    if mode == "overlay":
+        ax.legend(frameon=False, loc="upper right")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    return save_svg(fig)
+
+
+def build_histogram_panel(items: list[Summary], baseline: Summary | None, colors: dict[Path, str]) -> str:
+    if baseline is None or len(items) != 2:
+        return ""
+
+    challenger = next(item for item in items if item.path != baseline.path)
+    views = {
+        "overlay": build_histogram_chart(baseline, challenger, colors, "overlay"),
+        "baseline": build_histogram_chart(baseline, challenger, colors, "baseline"),
+        "challenger": build_histogram_chart(baseline, challenger, colors, "challenger"),
+    }
+
+    chart_html = "".join(
+        (
+            f"<div class='histogram-view{' is-active' if key == 'overlay' else ''}' "
+            f"data-histogram-view='{key}'>{svg}</div>"
+        )
+        for key, svg in views.items()
+    )
+
+    return (
+        "<section class='panel chart-panel histogram-panel' data-histogram-panel>"
+        "<div class='histogram-toolbar' role='tablist' aria-label='Histogram view'>"
+        "<button type='button' class='histogram-toggle is-active' data-histogram-target='overlay'>Overlay</button>"
+        f"<button type='button' class='histogram-toggle' data-histogram-target='baseline'>{html.escape(baseline.label)}</button>"
+        f"<button type='button' class='histogram-toggle' data-histogram-target='challenger'>{html.escape(challenger.label)}</button>"
+        "</div>"
+        "<p class='histogram-note'>Histogram view of baseline vs challenger. Buttons swap instantly between overlay and solo views.</p>"
+        f"{chart_html}"
+        "</section>"
+    )
+
+
 def build_sequence_chart(items: list[Summary], colors: dict[Path, str]) -> str:
     height = max(4.6, 2.2 * len(items) + 0.8)
     fig, axes = plt.subplots(
@@ -700,6 +790,7 @@ def build_html_report(items: list[Summary], baseline: Summary | None, title: str
     )
     ecdf_svg = build_ecdf_chart(items, colors, baseline.path if baseline else None)
     points_svg = build_points_chart(items, colors, baseline)
+    histogram_panel = build_histogram_panel(items, baseline, colors)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -765,6 +856,49 @@ def build_html_report(items: list[Summary], baseline: Summary | None, title: str
       .chart-panel svg {{
         width: 100%;
         height: auto;
+        display: block;
+      }}
+
+      .histogram-toolbar {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 2px 0 12px;
+      }}
+
+      .histogram-toggle {{
+        border: 1px solid var(--line);
+        background: #f6f0e7;
+        color: var(--muted);
+        border-radius: 999px;
+        padding: 8px 12px;
+        font: inherit;
+        font-size: 0.92rem;
+        font-weight: 600;
+        cursor: pointer;
+      }}
+
+      .histogram-toggle:hover {{
+        background: #efe7dc;
+      }}
+
+      .histogram-toggle.is-active {{
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fffdf8;
+      }}
+
+      .histogram-note {{
+        margin: 0 0 12px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }}
+
+      .histogram-view {{
+        display: none;
+      }}
+
+      .histogram-view.is-active {{
         display: block;
       }}
 
@@ -840,6 +974,10 @@ def build_html_report(items: list[Summary], baseline: Summary | None, title: str
         .panel {{
           overflow-x: auto;
         }}
+
+        .histogram-toolbar {{
+          flex-direction: column;
+        }}
       }}
     </style>
   </head>
@@ -852,9 +990,27 @@ def build_html_report(items: list[Summary], baseline: Summary | None, title: str
           {table}
         </section>
         <section class="panel chart-panel">{points_svg}</section>
+        {histogram_panel}
         <section class="panel chart-panel">{ecdf_svg}</section>
       </section>
     </main>
+    <script>
+      for (const panel of document.querySelectorAll("[data-histogram-panel]")) {{
+        const buttons = panel.querySelectorAll("[data-histogram-target]");
+        const views = panel.querySelectorAll("[data-histogram-view]");
+        for (const button of buttons) {{
+          button.addEventListener("click", () => {{
+            const target = button.dataset.histogramTarget;
+            for (const candidate of buttons) {{
+              candidate.classList.toggle("is-active", candidate === button);
+            }}
+            for (const view of views) {{
+              view.classList.toggle("is-active", view.dataset.histogramView === target);
+            }}
+          }});
+        }}
+      }}
+    </script>
   </body>
 </html>
 """

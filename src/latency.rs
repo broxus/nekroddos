@@ -965,6 +965,489 @@ fn build_log_data(should_log: bool, message: &ton_block::Message) -> Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, SecondsFormat};
+    use std::fs::File;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::UNIX_EPOCH;
+
+    struct WalletSchedule {
+        wallet_index: usize,
+        phase_ms: u64,
+        sends: Vec<SystemTime>,
+    }
+
+    fn build_wallet_schedule(
+        now: SystemTime,
+        total_wallets: u32,
+        sends_per_wallet: usize,
+        window_ms: u64,
+    ) -> Result<Vec<WalletSchedule>> {
+        let phases_ms = fixed_phases_ms(total_wallets, None, window_ms)?;
+
+        phases_ms
+            .into_iter()
+            .enumerate()
+            .map(|(wallet_index, phase_ms)| {
+                let first_send = next_fixed_phase_time(now, phase_ms, window_ms)?;
+                let sends = (0..sends_per_wallet)
+                    .map(|send_index| {
+                        let offset = Duration::from_millis(window_ms * send_index as u64);
+                        first_send + offset
+                    })
+                    .collect();
+
+                Ok(WalletSchedule {
+                    wallet_index,
+                    phase_ms,
+                    sends,
+                })
+            })
+            .collect()
+    }
+
+    fn format_utc(ts: SystemTime) -> String {
+        DateTime::<Utc>::from(ts).to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    fn write_wallet_schedule_csv(path: &Path, rows: &[WalletSchedule]) -> Result<()> {
+        let mut writer = File::create(path)?;
+        write!(writer, "wallet_index,phase_ms")?;
+        for send_index in 1..=rows.first().map(|row| row.sends.len()).unwrap_or(0) {
+            write!(writer, ",send_{send_index:02}_utc")?;
+        }
+        writeln!(writer)?;
+
+        for row in rows {
+            write!(writer, "{},{}", row.wallet_index, row.phase_ms)?;
+            for send_at in &row.sends {
+                write!(writer, ",{}", format_utc(*send_at))?;
+            }
+            writeln!(writer)?;
+        }
+
+        Ok(())
+    }
+
+    fn schedule_output_dir() -> Result<PathBuf> {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let path = std::env::temp_dir().join(format!(
+            "nekroddos-latency-schedule-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    fn render_wallet_schedule_animation_html(csv_path: &Path, html_path: &Path) -> Result<()> {
+        const SCRIPT: &str = r###"
+import csv
+import datetime as dt
+import json
+import sys
+
+csv_path = sys.argv[1]
+html_path = sys.argv[2]
+
+rows = []
+first_ms = None
+last_ms = None
+
+with open(csv_path, newline="") as handle:
+    reader = csv.DictReader(handle)
+    for row in reader:
+        wallet = int(row["wallet_index"])
+        send_times = []
+        for key, value in row.items():
+            if key.startswith("send_") and value:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                send_ms = int(parsed.timestamp() * 1000)
+                send_times.append({"iso": value, "ms": send_ms})
+                first_ms = send_ms if first_ms is None else min(first_ms, send_ms)
+                last_ms = send_ms if last_ms is None else max(last_ms, send_ms)
+        rows.append({
+            "wallet_index": wallet,
+            "phase_ms": int(row["phase_ms"]),
+            "sends": send_times,
+        })
+
+if first_ms is None or last_ms is None:
+    raise SystemExit("no schedule rows found in csv")
+
+payload = {
+    "rows": rows,
+    "first_ms": first_ms,
+    "last_ms": last_ms,
+}
+
+html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Wallet schedule animation</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f7f4ec;
+      --ink: #17212b;
+      --muted: #7e8a96;
+      --dot: #7da3c2;
+      --active: #d94841;
+      --grid: #d7d2c7;
+      --accent: #0f766e;
+    }}
+    body {{
+      margin: 0;
+      background: linear-gradient(180deg, #f9f6ef 0%, var(--bg) 100%);
+      color: var(--ink);
+      font: 14px/1.4 "Iosevka Term", "SFMono-Regular", monospace;
+    }}
+    .shell {{
+      max-width: 1680px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    .stack {{
+      display: grid;
+      gap: 14px;
+    }}
+    .topline {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      margin-bottom: 12px;
+    }}
+    .headline {{
+      font-size: 20px;
+      font-weight: 700;
+    }}
+    .controls {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+    }}
+    button {{
+      border: 1px solid var(--accent);
+      background: white;
+      color: var(--accent);
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      font: inherit;
+    }}
+    svg {{
+      width: 100%;
+      height: auto;
+      display: block;
+      border: 1px solid #d9d3c7;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 18px 40px rgba(23, 33, 43, 0.08);
+    }}
+    .tick {{
+      stroke: var(--grid);
+      stroke-width: 1;
+    }}
+    .tick-label {{
+      fill: var(--muted);
+      font-size: 11px;
+      text-anchor: middle;
+    }}
+    .axis-label {{
+      fill: var(--muted);
+      font-size: 12px;
+    }}
+    .wallet-label {{
+      fill: var(--muted);
+      font-size: 9px;
+      text-anchor: end;
+      dominant-baseline: middle;
+    }}
+    .cursor {{
+      stroke: var(--accent);
+      stroke-width: 2;
+      stroke-dasharray: 6 4;
+    }}
+    .dot {{
+      fill: var(--dot);
+      transition: fill 80ms linear;
+    }}
+    .dot.sent {{
+      fill: var(--active);
+    }}
+    .message-panel {{
+      border: 1px solid #d9d3c7;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 18px 40px rgba(23, 33, 43, 0.08);
+      padding: 14px 16px;
+    }}
+    .message-title {{
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }}
+    .message-subtitle {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 8px;
+    }}
+    .event-timeline {{
+      position: relative;
+      min-height: 78px;
+      overflow: hidden;
+      border-top: 1px solid var(--grid);
+      padding-top: 12px;
+    }}
+    .event-track {{
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 34px;
+      height: 2px;
+      background: linear-gradient(90deg, #e7e1d6 0%, #d7d2c7 100%);
+    }}
+    .event-dot {{
+      position: absolute;
+      top: 18px;
+      width: 44px;
+      height: 28px;
+      margin-left: -22px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: var(--active);
+      color: white;
+      font-size: 11px;
+      font-weight: 700;
+      box-shadow: 0 10px 22px rgba(217, 72, 65, 0.28);
+      transform: scale(0.7);
+      opacity: 0;
+      animation: pop-in 220ms ease-out forwards;
+    }}
+    @keyframes pop-in {{
+      0% {{
+        transform: scale(0.35) translateY(12px);
+        opacity: 0;
+      }}
+      75% {{
+        transform: scale(1.08) translateY(-2px);
+        opacity: 1;
+      }}
+      100% {{
+        transform: scale(1) translateY(0);
+        opacity: 1;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="stack">
+      <div class="topline">
+        <div>
+          <div class="headline">Wallet send schedule animation</div>
+          <div>1x playback, account 0 on top, dots stay red after send time.</div>
+        </div>
+        <div class="controls">
+          <button id="replay" type="button">Replay</button>
+          <div id="status">Current: --:--:--</div>
+        </div>
+      </div>
+      <svg id="chart" role="img" aria-label="Animated wallet send schedule"></svg>
+      <div class="message-panel">
+        <div class="message-title">Last sent</div>
+        <div id="event-timeline" class="event-timeline" aria-live="polite">
+          <div class="event-track"></div>
+        </div>
+        <div id="event-caption" class="message-subtitle">Waiting for first send...</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const payload = {json.dumps(payload)};
+    const rows = payload.rows;
+    const firstMs = payload.first_ms;
+    const lastMs = payload.last_ms;
+    const spanMs = Math.max(lastMs - firstMs, 1);
+    const margin = {{ top: 36, right: 24, bottom: 46, left: 72 }};
+    const rowHeight = 10;
+    const chartWidth = 1560;
+    const chartHeight = margin.top + margin.bottom + rows.length * rowHeight;
+    const svg = document.getElementById("chart");
+    const status = document.getElementById("status");
+    const eventTimeline = document.getElementById("event-timeline");
+    const eventCaption = document.getElementById("event-caption");
+    svg.setAttribute("viewBox", `0 0 ${{chartWidth}} ${{chartHeight}}`);
+
+    const ns = "http://www.w3.org/2000/svg";
+    const plotWidth = chartWidth - margin.left - margin.right;
+    const plotHeight = chartHeight - margin.top - margin.bottom;
+    const dots = [];
+    const events = [];
+    const eventTrack = eventTimeline.firstElementChild;
+    let lastSentDot = null;
+
+    function xFor(ms) {{
+      return margin.left + ((ms - firstMs) / spanMs) * plotWidth;
+    }}
+
+    function yFor(walletIndex) {{
+      return margin.top + walletIndex * rowHeight + rowHeight / 2;
+    }}
+
+    function fmt(ms) {{
+      return new Date(ms).toISOString().slice(11, 19);
+    }}
+
+    function el(name, attrs = {{}}, text = null) {{
+      const node = document.createElementNS(ns, name);
+      for (const [key, value] of Object.entries(attrs)) {{
+        node.setAttribute(key, value);
+      }}
+      if (text !== null) {{
+        node.textContent = text;
+      }}
+      return node;
+    }}
+
+    svg.appendChild(el("rect", {{ x: 0, y: 0, width: chartWidth, height: chartHeight, fill: "transparent" }}));
+
+    for (let step = 0; step <= 6; step += 1) {{
+      const ms = firstMs + (spanMs * step) / 6;
+      const x = xFor(ms);
+      svg.appendChild(el("line", {{ x1: x, y1: margin.top, x2: x, y2: chartHeight - margin.bottom, class: "tick" }}));
+      svg.appendChild(el("text", {{ x, y: chartHeight - 14, class: "tick-label" }}, fmt(ms)));
+    }}
+
+    svg.appendChild(el("text", {{ x: chartWidth / 2, y: chartHeight - 4, class: "axis-label", "text-anchor": "middle" }}, "Scheduled UTC time"));
+
+    for (const row of rows) {{
+      const y = yFor(row.wallet_index);
+      if (row.wallet_index % 25 === 0 || row.wallet_index === rows.length - 1) {{
+        svg.appendChild(el("text", {{ x: margin.left - 10, y, class: "wallet-label" }}, `${{row.wallet_index}}`));
+      }}
+      svg.appendChild(el("line", {{ x1: margin.left, y1: y, x2: chartWidth - margin.right, y2: y, class: "tick", "stroke-opacity": "0.18" }}));
+      for (const send of row.sends) {{
+        const dot = el("circle", {{
+          cx: xFor(send.ms),
+          cy: y,
+          r: 2.3,
+          class: "dot",
+          "data-send-ms": send.ms,
+        }});
+        svg.appendChild(dot);
+        dots.push(dot);
+        events.push({{ sendMs: send.ms, dot, walletIndex: row.wallet_index }});
+      }}
+    }}
+
+    svg.appendChild(el("text", {{
+      x: 16,
+      y: margin.top + plotHeight / 2,
+      class: "axis-label",
+      transform: `rotate(-90 16 ${{margin.top + plotHeight / 2}})`,
+      "text-anchor": "middle",
+    }}, "Wallet index"));
+
+    const cursor = el("line", {{
+      x1: margin.left,
+      y1: margin.top,
+      x2: margin.left,
+      y2: chartHeight - margin.bottom,
+      class: "cursor",
+    }});
+    svg.appendChild(cursor);
+
+    events.sort((a, b) => a.sendMs - b.sendMs);
+    let startAt = null;
+    let nextEvent = 0;
+
+    function pushTimelineDot(walletIndex, sendMs) {{
+      if (lastSentDot) {{
+        lastSentDot.remove();
+      }}
+      const dot = document.createElement("div");
+      dot.className = "event-dot";
+      dot.textContent = `[${{walletIndex}}]`;
+      const left = ((sendMs - firstMs) / spanMs) * 100;
+      dot.style.left = `${{left}}%`;
+      dot.title = `account ${{walletIndex}} at ${{fmt(sendMs)}}`;
+      eventTimeline.appendChild(dot);
+      lastSentDot = dot;
+      eventCaption.textContent = `Last sent: [${{walletIndex}}] at ${{fmt(sendMs)}}`;
+    }}
+
+    function reset() {{
+      for (const dot of dots) {{
+        dot.classList.remove("sent");
+      }}
+      eventTimeline.replaceChildren(eventTrack.cloneNode(true));
+      lastSentDot = null;
+      nextEvent = 0;
+      startAt = null;
+      cursor.setAttribute("x1", margin.left);
+      cursor.setAttribute("x2", margin.left);
+      status.textContent = `Current: ${{fmt(firstMs)}}`;
+      eventCaption.textContent = "Waiting for first send...";
+      requestAnimationFrame(step);
+    }}
+
+    function step(frameAt) {{
+      if (startAt === null) {{
+        startAt = frameAt;
+      }}
+      const elapsed = frameAt - startAt;
+      const currentMs = Math.min(firstMs + elapsed, lastMs);
+      const x = xFor(currentMs);
+      cursor.setAttribute("x1", x);
+      cursor.setAttribute("x2", x);
+      status.textContent = `Current: ${{fmt(currentMs)}}`;
+
+      while (nextEvent < events.length && events[nextEvent].sendMs <= currentMs) {{
+        const event = events[nextEvent];
+        event.dot.classList.add("sent");
+        pushTimelineDot(event.walletIndex, event.sendMs);
+        nextEvent += 1;
+      }}
+
+      if (currentMs < lastMs) {{
+        requestAnimationFrame(step);
+      }}
+    }}
+
+    document.getElementById("replay").addEventListener("click", reset);
+    status.textContent = `Current: ${{fmt(firstMs)}}`;
+    requestAnimationFrame(step);
+  </script>
+</body>
+</html>
+"""
+
+with open(html_path, "w", encoding="utf-8") as handle:
+    handle.write(html)
+"###;
+
+        let output = Command::new("python")
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg(csv_path)
+            .arg(html_path)
+            .output()?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "python html render failed: status={} stdout={} stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
 
     #[test]
     fn window_ms_rejects_zero() {
@@ -1110,6 +1593,51 @@ mod tests {
             error,
             "timeout waiting for stream update: address=0:def prev_lt=77 waited_ms=60500 balance_query_error=rpc exploded"
         );
+    }
+
+    #[test]
+    #[ignore = "writes temp artifacts and requires python"]
+    fn generate_multi_wallet_schedule_csv_and_animation_html() {
+        let now = SystemTime::now();
+        let rows = build_wallet_schedule(now, 250, 60, 5_000).unwrap();
+
+        assert_eq!(rows.len(), 250);
+        assert_eq!(rows.first().map(|row| row.wallet_index), Some(0));
+        assert_eq!(rows.last().map(|row| row.wallet_index), Some(249));
+        let unique = rows
+            .iter()
+            .map(|row| row.phase_ms)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), rows.len());
+
+        for row in &rows {
+            assert_eq!(row.sends.len(), 60);
+
+            let first = next_fixed_phase_time(now, row.phase_ms, 5_000).unwrap();
+            assert_eq!(row.sends[0], first);
+
+            for pair in row.sends.windows(2) {
+                assert_eq!(pair[1].duration_since(pair[0]).unwrap(), Duration::from_secs(5));
+            }
+        }
+
+        let out_dir = schedule_output_dir().unwrap();
+        let csv_path = out_dir.join("wallet_schedule.csv");
+        let html_path = out_dir.join("wallet_schedule.html");
+
+        write_wallet_schedule_csv(&csv_path, &rows).unwrap();
+        render_wallet_schedule_animation_html(&csv_path, &html_path).unwrap();
+
+        assert!(csv_path.is_file(), "missing csv artifact at {:?}", csv_path);
+        assert!(html_path.is_file(), "missing html artifact at {:?}", html_path);
+
+        let html = std::fs::read_to_string(&html_path).unwrap();
+        assert!(html.contains("requestAnimationFrame"));
+        assert!(html.contains("dots stay red after send time"));
+        assert!(html.contains("Replay"));
+
+        println!("wallet schedule csv: {}", csv_path.display());
+        println!("wallet schedule animation: {}", html_path.display());
     }
 
     #[tokio::test]
