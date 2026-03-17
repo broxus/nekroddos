@@ -64,7 +64,6 @@ impl TestEnv {
             }
         })
     }
-
 }
 
 fn burst_size(rps: u32) -> NonZeroU32 {

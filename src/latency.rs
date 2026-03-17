@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use ton_block::MsgAddressInt;
 use ton_types::UInt256;
 
@@ -33,6 +33,10 @@ pub struct LatencyTestArgs {
     #[clap(long, value_name = "MS")]
     /// Fixed spacing between wallet phases; omitted values are inferred from wallet count
     step_ms: Option<u64>,
+
+    #[clap(long, value_name = "SECONDS", default_value = "5")]
+    /// Scheduler cycle length in seconds
+    window_secs: u64,
 
     #[clap(short, long, default_value = "1000000")]
     /// Amount to send in nanotons
@@ -67,6 +71,7 @@ pub(crate) async fn run(
     const COST_PER_TRANSACTION: u64 = 8_857_001;
 
     validate_total_wallets(latency_args.total_wallets)?;
+    let window_ms = window_ms(latency_args.window_secs)?;
     if common_args.no_wait {
         anyhow::bail!("--no-wait is not supported by latency");
     }
@@ -88,6 +93,7 @@ pub(crate) async fn run(
             client,
             &deployments_path,
             COST_PER_TRANSACTION,
+            window_ms,
         )
         .await
     } else {
@@ -97,6 +103,7 @@ pub(crate) async fn run(
             client,
             &deployments_path,
             COST_PER_TRANSACTION,
+            window_ms,
         )
         .await
     }
@@ -108,9 +115,10 @@ async fn run_single_wallet(
     client: RpcClient,
     deployments_path: &Path,
     cost_per_transaction: u64,
+    window_ms: u64,
 ) -> Result<()> {
     let step_ms = latency_args.step_ms.unwrap_or(10);
-    validate_legacy_step_ms(step_ms)?;
+    validate_legacy_step_ms(step_ms, window_ms)?;
 
     let sender = load_single_sender(deployments_path)?;
     log::info!("Sender address: {}", sender);
@@ -121,9 +129,10 @@ async fn run_single_wallet(
     let requested_txs = std::cmp::min(latency_args.num_txs, max_iterations as usize);
 
     log::info!(
-        "Starting latency test - sending {} transactions on {}ms per-second phases",
+        "Starting latency test - sending {} transactions on {}ms phases within {}s windows",
         latency_args.num_txs,
-        step_ms
+        step_ms,
+        latency_args.window_secs
     );
     log::info!(
         "Initial balance: {}, required balance: {}, max sendable transactions: {}",
@@ -137,7 +146,7 @@ async fn run_single_wallet(
     let should_log = latency_args.log_file.is_some();
 
     for slot_index in 0..requested_txs {
-        sleep_until_slot(step_ms, slot_index).await?;
+        sleep_until_slot(step_ms, slot_index, window_ms).await?;
         let outcome = send_test_transaction(
             &client,
             keypair,
@@ -165,11 +174,12 @@ async fn run_multi_wallet(
     client: RpcClient,
     deployments_path: &Path,
     cost_per_transaction: u64,
+    window_ms: u64,
 ) -> Result<()> {
     let wallet_count = latency_args.total_wallets as usize;
     let per_wallet_txs = latency_args.num_txs.div_ceil(wallet_count);
     let amount = latency_args.amount;
-    let phases_ms = fixed_phases_ms(latency_args.total_wallets, latency_args.step_ms)?;
+    let phases_ms = fixed_phases_ms(latency_args.total_wallets, latency_args.step_ms, window_ms)?;
     let senders = load_sender_wallets(
         client.clone(),
         deployments_path,
@@ -180,10 +190,11 @@ async fn run_multi_wallet(
     let keypair_bytes = keypair.to_bytes();
 
     log::info!(
-        "Starting multi-wallet latency test - {} wallets, {} sends per wallet, {} total scheduled sends",
+        "Starting multi-wallet latency test - {} wallets, {} sends per wallet, {} total scheduled sends within {}s windows",
         wallet_count,
         per_wallet_txs,
-        per_wallet_txs.saturating_mul(wallet_count)
+        per_wallet_txs.saturating_mul(wallet_count),
+        latency_args.window_secs
     );
 
     let receiver = zero_address()?;
@@ -214,7 +225,7 @@ async fn run_multi_wallet(
             .map_err(|error| anyhow::anyhow!("failed to clone keypair from bytes: {error}"))?;
         let handle = tokio::spawn(async move {
             for _ in 0..per_wallet_txs {
-                sleep_until_fixed_phase(phase_ms).await?;
+                sleep_until_fixed_phase(phase_ms, window_ms).await?;
                 let outcome = send_test_transaction(
                     &client,
                     &sender_keypair,
@@ -271,49 +282,62 @@ fn validate_total_wallets(total_wallets: u32) -> Result<()> {
     Ok(())
 }
 
-fn validate_legacy_step_ms(step_ms: u64) -> Result<()> {
+fn window_ms(window_secs: u64) -> Result<u64> {
+    if window_secs == 0 {
+        anyhow::bail!("window-secs must be > 0");
+    }
+    window_secs
+        .checked_mul(1000)
+        .context("window-secs is too large to convert to milliseconds")
+}
+
+fn validate_legacy_step_ms(step_ms: u64, window_ms: u64) -> Result<()> {
     if step_ms == 0 {
         anyhow::bail!("step-ms must be > 0");
     }
-    if 1000 % step_ms != 0 {
-        anyhow::bail!("step-ms must divide 1000 for per-second slot scheduling");
+    if !window_ms.is_multiple_of(step_ms) {
+        anyhow::bail!("step-ms must divide the configured window for slot scheduling");
     }
     Ok(())
 }
 
-fn validate_fixed_step_ms(total_wallets: u32, step_ms: u64) -> Result<()> {
+fn validate_fixed_step_ms(total_wallets: u32, step_ms: u64, window_ms: u64) -> Result<()> {
     if step_ms == 0 {
         anyhow::bail!("step-ms must be > 0");
     }
-    if u64::from(total_wallets).saturating_mul(step_ms) >= 1000 {
-        anyhow::bail!("total-wallets * step-ms must be < 1000");
+    if u64::from(total_wallets).saturating_mul(step_ms) >= window_ms {
+        anyhow::bail!("total-wallets * step-ms must be < the configured window");
     }
     Ok(())
 }
 
-fn fixed_phases_ms(total_wallets: u32, step_ms: Option<u64>) -> Result<Vec<u64>> {
+fn fixed_phases_ms(total_wallets: u32, step_ms: Option<u64>, window_ms: u64) -> Result<Vec<u64>> {
     if let Some(step_ms) = step_ms {
-        validate_fixed_step_ms(total_wallets, step_ms)?;
+        validate_fixed_step_ms(total_wallets, step_ms, window_ms)?;
         return Ok((1..=total_wallets)
             .map(|index| u64::from(index) * step_ms)
             .collect());
     }
 
     let phases: Vec<_> = (0..total_wallets)
-        .map(|index| ((u64::from(index) + 1) * 1000) / (u64::from(total_wallets) + 1))
+        .map(|index| ((u64::from(index) + 1) * window_ms) / (u64::from(total_wallets) + 1))
         .collect();
     if phases
         .iter()
-        .any(|phase_ms| *phase_ms == 0 || *phase_ms >= 1000)
+        .any(|phase_ms| *phase_ms == 0 || *phase_ms >= window_ms)
     {
-        anyhow::bail!("could not infer interior fixed phases for total-wallets={total_wallets}");
+        anyhow::bail!(
+            "could not infer interior fixed phases for total-wallets={total_wallets} in the configured window"
+        );
     }
     let unique = phases
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
     if unique.len() != phases.len() {
-        anyhow::bail!("could not infer interior fixed phases for total-wallets={total_wallets}");
+        anyhow::bail!(
+            "could not infer interior fixed phases for total-wallets={total_wallets} in the configured window"
+        );
     }
     Ok(phases)
 }
@@ -408,7 +432,6 @@ async fn current_balance(client: &RpcClient, sender: &MsgAddressInt) -> Result<u
 
 fn zero_address() -> Result<MsgAddressInt> {
     MsgAddressInt::from_str("0:0000000000000000000000000000000000000000000000000000000000000000")
-        .map_err(Into::into)
 }
 
 #[derive(Clone)]
@@ -449,6 +472,13 @@ enum TxCompletion {
         timed_out: bool,
         log_record: Option<LogRecord>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitForUpdateError {
+    Closed,
+    TimedOut,
+    Reconcile,
 }
 
 struct CollectedResults {
@@ -557,6 +587,23 @@ fn write_log_record(
     Ok(())
 }
 
+fn format_timeout_error(
+    address: &str,
+    prev_lt: u64,
+    waited: Duration,
+    balance: std::result::Result<u128, String>,
+) -> String {
+    let waited_ms = waited.as_millis();
+    match balance {
+        Ok(balance) => format!(
+            "timeout waiting for stream update: address={address} prev_lt={prev_lt} waited_ms={waited_ms} balance={balance}"
+        ),
+        Err(error) => format!(
+            "timeout waiting for stream update: address={address} prev_lt={prev_lt} waited_ms={waited_ms} balance_query_error={error}"
+        ),
+    }
+}
+
 fn report_results(mut results: CollectedResults, latency_args: &LatencyTestArgs) -> Result<()> {
     if !results.latencies.is_empty() {
         results.latencies.sort();
@@ -613,42 +660,63 @@ fn report_results(mut results: CollectedResults, latency_args: &LatencyTestArgs)
     Ok(())
 }
 
-fn slot_phase_ms(step_ms: u64, slot_index: usize) -> u64 {
-    let slots_per_second = 1000 / step_ms;
+fn slot_phase_ms(step_ms: u64, slot_index: usize, window_ms: u64) -> u64 {
+    let slots_per_window = window_ms / step_ms;
     let slot_index = u64::try_from(slot_index).unwrap();
-    (slot_index % slots_per_second) * step_ms
+    (slot_index % slots_per_window) * step_ms
 }
 
-fn next_slot_time(after: SystemTime, step_ms: u64, slot_index: usize) -> Result<SystemTime> {
-    let phase_ms = slot_phase_ms(step_ms, slot_index);
-    next_phase_time(after, phase_ms, false)
+fn next_slot_time(
+    after: SystemTime,
+    step_ms: u64,
+    slot_index: usize,
+    window_ms: u64,
+) -> Result<SystemTime> {
+    let phase_ms = slot_phase_ms(step_ms, slot_index, window_ms);
+    next_phase_time(after, phase_ms, window_ms, false)
 }
 
-fn next_fixed_phase_time(after: SystemTime, phase_ms: u64) -> Result<SystemTime> {
-    next_phase_time(after, phase_ms, true)
+fn next_fixed_phase_time(after: SystemTime, phase_ms: u64, window_ms: u64) -> Result<SystemTime> {
+    next_phase_time(after, phase_ms, window_ms, true)
 }
 
-fn next_phase_time(after: SystemTime, phase_ms: u64, strict_future: bool) -> Result<SystemTime> {
+fn next_phase_time(
+    after: SystemTime,
+    phase_ms: u64,
+    window_ms: u64,
+    strict_future: bool,
+) -> Result<SystemTime> {
     let since_epoch = after.duration_since(SystemTime::UNIX_EPOCH)?;
-    let second_ns = 1_000_000_000u128;
+    let window_ns = u128::from(window_ms) * 1_000_000;
     let phase_ns = u128::from(phase_ms) * 1_000_000;
     let current_ns = since_epoch.as_nanos();
-    let second_start_ns = current_ns - (current_ns % second_ns);
-    let mut target_ns = second_start_ns + phase_ns;
+    let window_start_ns = current_ns - (current_ns % window_ns);
+    let mut target_ns = window_start_ns + phase_ns;
 
     if (strict_future && target_ns <= current_ns) || (!strict_future && target_ns < current_ns) {
-        target_ns += second_ns;
+        target_ns += window_ns;
     }
 
     Ok(SystemTime::UNIX_EPOCH + Duration::from_nanos(u64::try_from(target_ns).unwrap()))
 }
 
-async fn sleep_until_slot(step_ms: u64, slot_index: usize) -> Result<()> {
-    sleep_until(next_slot_time(SystemTime::now(), step_ms, slot_index)?).await
+async fn sleep_until_slot(step_ms: u64, slot_index: usize, window_ms: u64) -> Result<()> {
+    sleep_until(next_slot_time(
+        SystemTime::now(),
+        step_ms,
+        slot_index,
+        window_ms,
+    )?)
+    .await
 }
 
-async fn sleep_until_fixed_phase(phase_ms: u64) -> Result<()> {
-    sleep_until(next_fixed_phase_time(SystemTime::now(), phase_ms)?).await
+async fn sleep_until_fixed_phase(phase_ms: u64, window_ms: u64) -> Result<()> {
+    sleep_until(next_fixed_phase_time(
+        SystemTime::now(),
+        phase_ms,
+        window_ms,
+    )?)
+    .await
 }
 
 async fn sleep_until(target: SystemTime) -> Result<()> {
@@ -656,6 +724,60 @@ async fn sleep_until(target: SystemTime) -> Result<()> {
     let wait = target.duration_since(now).unwrap_or(Duration::ZERO);
     tokio::time::sleep(wait).await;
     Ok(())
+}
+
+async fn wait_for_wallet_update<F, Fut>(
+    mut reconcile: F,
+    updates: &mut tokio::sync::watch::Receiver<Option<stream::StreamUpdate>>,
+    gaps: &mut tokio::sync::watch::Receiver<u64>,
+    prev_lt: u64,
+    timeout: Duration,
+) -> std::result::Result<(), WaitForUpdateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            if updates
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|update| update.max_lt > prev_lt)
+            {
+                return Ok(());
+            }
+
+            tokio::select! {
+                changed = updates.changed() => {
+                    changed.map_err(|_| WaitForUpdateError::Closed)?;
+                }
+                changed = gaps.changed() => {
+                    changed.map_err(|_| WaitForUpdateError::Closed)?;
+                    let _ = gaps.borrow_and_update();
+                    if reconcile()
+                        .await
+                        .map_err(|_| WaitForUpdateError::Reconcile)?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| WaitForUpdateError::TimedOut)?
+}
+
+async fn reconcile_wallet_update(
+    client: &RpcClient,
+    sender: &MsgAddressInt,
+    prev_lt: u64,
+) -> Result<bool> {
+    let state = client
+        .get_contract_state(sender, None)
+        .await?
+        .context("sender state not found during reconciliation")?;
+    Ok(state.account.storage.last_trans_lt > prev_lt)
 }
 
 async fn send_test_transaction(
@@ -711,6 +833,9 @@ async fn send_test_transaction(
             };
         }
     };
+    let _ = updates.borrow_and_update();
+    let mut gaps = stream.subscribe_gaps();
+    let _ = gaps.borrow_and_update();
 
     let outcome = send::send(
         client,
@@ -725,6 +850,9 @@ async fn send_test_transaction(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
+            drop(updates);
+            drop(gaps);
+            stream.release_addr(&address);
             return TxCompletion::Failed {
                 error: error.to_string(),
                 timed_out: false,
@@ -736,6 +864,9 @@ async fn send_test_transaction(
     let log_data = match build_log_data(should_log, &outcome.message) {
         Ok(log_data) => log_data,
         Err(error) => {
+            drop(updates);
+            drop(gaps);
+            stream.release_addr(&address);
             return TxCompletion::Failed {
                 error: error.to_string(),
                 timed_out: false,
@@ -745,6 +876,9 @@ async fn send_test_transaction(
     };
 
     if let Err(error) = outcome.broadcast_result {
+        drop(updates);
+        drop(gaps);
+        stream.release_addr(&address);
         return TxCompletion::Failed {
             error: error.to_string(),
             timed_out: false,
@@ -752,35 +886,66 @@ async fn send_test_transaction(
         };
     }
 
-    loop {
-        match tokio::time::timeout(Duration::from_secs(60), updates.recv()).await {
-            Ok(Ok(update)) => {
-                let _ = (update.gen_utime, update.dropped);
-                if update.address == address && update.max_lt > prev_lt {
-                    return TxCompletion::Confirmed {
-                        started_at,
-                        latency: start.elapsed(),
-                        log_record: log_data.map(|data| LogRecord { data, lost: false }),
-                    };
+    let outcome = match wait_for_wallet_update(
+        || reconcile_wallet_update(client, &sender, prev_lt),
+        &mut updates,
+        &mut gaps,
+        prev_lt,
+        Duration::from_secs(60),
+    )
+    .await
+    {
+        Ok(()) => TxCompletion::Confirmed {
+            started_at,
+            latency: start.elapsed(),
+            log_record: log_data.map(|data| LogRecord { data, lost: false }),
+        },
+        Err(WaitForUpdateError::Closed) => TxCompletion::Failed {
+            error: "stream updates channel closed".to_owned(),
+            timed_out: false,
+            log_record: log_data.map(|data| LogRecord { data, lost: true }),
+        },
+        Err(WaitForUpdateError::Reconcile) => TxCompletion::Failed {
+            error: "stream gap reconciliation failed".to_owned(),
+            timed_out: false,
+            log_record: log_data.map(|data| LogRecord { data, lost: true }),
+        },
+        Err(WaitForUpdateError::TimedOut) => {
+            match reconcile_wallet_update(client, &sender, prev_lt).await {
+                Ok(true) => TxCompletion::Confirmed {
+                    started_at,
+                    latency: start.elapsed(),
+                    log_record: log_data.map(|data| LogRecord { data, lost: false }),
+                },
+                Ok(false) => {
+                    // Re-query the sender only on timeout so the failure log shows whether
+                    // the wallet was still funded when the stream confirmation never arrived.
+                    let error = format_timeout_error(
+                        &address,
+                        prev_lt,
+                        start.elapsed(),
+                        current_balance(client, &sender)
+                            .await
+                            .map_err(|error| error.to_string()),
+                    );
+                    TxCompletion::Failed {
+                        error,
+                        timed_out: true,
+                        log_record: log_data.map(|data| LogRecord { data, lost: true }),
+                    }
                 }
-            }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => {
-                return TxCompletion::Failed {
-                    error: "stream updates channel closed".to_owned(),
+                Err(error) => TxCompletion::Failed {
+                    error: format!("failed to reconcile wallet update after timeout: {error}"),
                     timed_out: false,
                     log_record: log_data.map(|data| LogRecord { data, lost: true }),
-                };
-            }
-            Err(_) => {
-                return TxCompletion::Failed {
-                    error: "timeout waiting for stream update".to_owned(),
-                    timed_out: true,
-                    log_record: log_data.map(|data| LogRecord { data, lost: true }),
-                };
+                },
             }
         }
-    }
+    };
+    drop(updates);
+    drop(gaps);
+    stream.release_addr(&address);
+    outcome
 }
 
 fn build_log_data(should_log: bool, message: &ton_block::Message) -> Result<Option<LogData>> {
@@ -802,113 +967,236 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slot_phase_wraps_each_second() {
-        assert_eq!(slot_phase_ms(10, 0), 0);
-        assert_eq!(slot_phase_ms(10, 1), 10);
-        assert_eq!(slot_phase_ms(10, 2), 20);
-        assert_eq!(slot_phase_ms(10, 99), 990);
-        assert_eq!(slot_phase_ms(10, 100), 0);
+    fn window_ms_rejects_zero() {
+        let error = window_ms(0).unwrap_err();
+        assert_eq!(error.to_string(), "window-secs must be > 0");
+    }
+
+    #[test]
+    fn slot_phase_wraps_each_window() {
+        assert_eq!(slot_phase_ms(10, 0, 5_000), 0);
+        assert_eq!(slot_phase_ms(10, 1, 5_000), 10);
+        assert_eq!(slot_phase_ms(10, 2, 5_000), 20);
+        assert_eq!(slot_phase_ms(10, 499, 5_000), 4_990);
+        assert_eq!(slot_phase_ms(10, 500, 5_000), 0);
     }
 
     #[test]
     fn validate_legacy_step_ms_rejects_non_divisor() {
-        let error = validate_legacy_step_ms(7).unwrap_err();
+        let error = validate_legacy_step_ms(7, 5_000).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "step-ms must divide 1000 for per-second slot scheduling"
+            "step-ms must divide the configured window for slot scheduling"
         );
     }
 
     #[test]
     fn validate_fixed_step_ms_rejects_dense_spacing() {
-        let error = validate_fixed_step_ms(10, 100).unwrap_err();
-        assert_eq!(error.to_string(), "total-wallets * step-ms must be < 1000");
+        let error = validate_fixed_step_ms(51, 100, 5_000).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "total-wallets * step-ms must be < the configured window"
+        );
     }
 
     #[test]
     fn inferred_phases_evenly_spread_wallets() {
         assert_eq!(
-            fixed_phases_ms(10, None).unwrap(),
-            vec![90, 181, 272, 363, 454, 545, 636, 727, 818, 909]
+            fixed_phases_ms(3, None, 5_000).unwrap(),
+            vec![1_250, 2_500, 3_750]
         );
     }
 
     #[test]
     fn inferred_phases_reject_non_interior_ms() {
-        let error = fixed_phases_ms(1000, None).unwrap_err();
+        let error = fixed_phases_ms(5_000, None, 5_000).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "could not infer interior fixed phases for total-wallets=1000"
+            "could not infer interior fixed phases for total-wallets=5000 in the configured window"
         );
     }
 
     #[test]
     fn inferred_phases_reject_duplicate_ms() {
-        let error = fixed_phases_ms(1001, None).unwrap_err();
+        let error = fixed_phases_ms(5_001, None, 5_000).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "could not infer interior fixed phases for total-wallets=1001"
+            "could not infer interior fixed phases for total-wallets=5001 in the configured window"
         );
     }
 
     #[test]
     fn explicit_phases_use_step_ms() {
-        assert_eq!(fixed_phases_ms(3, Some(100)).unwrap(), vec![100, 200, 300]);
+        assert_eq!(
+            fixed_phases_ms(3, Some(100), 5_000).unwrap(),
+            vec![100, 200, 300]
+        );
     }
 
     #[test]
-    fn next_slot_time_rolls_to_same_phase_next_second() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_043);
-        let next = next_slot_time(after, 10, 1).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(2_010);
+    fn next_slot_time_rolls_to_same_phase_next_window() {
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(5_043);
+        let next = next_slot_time(after, 10, 1, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(10_010);
         assert_eq!(next, expected);
     }
 
     #[test]
-    fn next_slot_time_uses_same_second_when_phase_is_future() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_007);
-        let next = next_slot_time(after, 10, 1).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(1_010);
+    fn next_slot_time_uses_same_window_when_phase_is_future() {
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(5_007);
+        let next = next_slot_time(after, 10, 1, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(5_010);
         assert_eq!(next, expected);
     }
 
     #[test]
     fn next_slot_time_uses_exact_boundary() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_010);
-        let next = next_slot_time(after, 10, 1).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(1_010);
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(5_010);
+        let next = next_slot_time(after, 10, 1, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(5_010);
         assert_eq!(next, expected);
     }
 
     #[test]
-    fn next_slot_time_wraps_slot_phase_after_full_second() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(3_400);
-        let next = next_slot_time(after, 10, 100).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(4_000);
+    fn next_slot_time_wraps_slot_phase_after_full_window() {
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(13_400);
+        let next = next_slot_time(after, 10, 500, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(15_000);
         assert_eq!(next, expected);
     }
 
     #[test]
-    fn fixed_phase_uses_current_second_when_future() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_200);
-        let next = next_fixed_phase_time(after, 300).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(1_300);
+    fn fixed_phase_uses_current_window_when_future() {
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(5_200);
+        let next = next_fixed_phase_time(after, 300, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(5_300);
         assert_eq!(next, expected);
     }
 
     #[test]
-    fn fixed_phase_skips_exact_boundary_to_next_second() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_300);
-        let next = next_fixed_phase_time(after, 300).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(2_300);
+    fn fixed_phase_skips_exact_boundary_to_next_window() {
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(5_300);
+        let next = next_fixed_phase_time(after, 300, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(10_300);
         assert_eq!(next, expected);
     }
 
     #[test]
-    fn fixed_phase_skips_missed_second() {
-        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(1_301);
-        let next = next_fixed_phase_time(after, 300).unwrap();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(2_300);
+    fn fixed_phase_skips_missed_window() {
+        let after = SystemTime::UNIX_EPOCH + Duration::from_millis(5_301);
+        let next = next_fixed_phase_time(after, 300, 5_000).unwrap();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_millis(10_300);
         assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn timeout_error_includes_balance() {
+        let error = format_timeout_error("0:abc", 42, Duration::from_millis(60_000), Ok(123_456));
+        assert_eq!(
+            error,
+            "timeout waiting for stream update: address=0:abc prev_lt=42 waited_ms=60000 balance=123456"
+        );
+    }
+
+    #[test]
+    fn timeout_error_includes_balance_query_error() {
+        let error = format_timeout_error(
+            "0:def",
+            77,
+            Duration::from_millis(60_500),
+            Err("rpc exploded".to_owned()),
+        );
+        assert_eq!(
+            error,
+            "timeout waiting for stream update: address=0:def prev_lt=77 waited_ms=60500 balance_query_error=rpc exploded"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_wallet_update_accepts_newer_lt() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let (_gap_tx, mut gaps) = tokio::sync::watch::channel(0);
+
+        tokio::spawn(async move {
+            tx.send_replace(Some(stream::StreamUpdate {
+                address: "0:abc".to_owned(),
+                max_lt: 10,
+            }));
+        });
+
+        assert_eq!(
+            wait_for_wallet_update(
+                || async { Ok(false) },
+                &mut rx,
+                &mut gaps,
+                9,
+                Duration::from_secs(1),
+            )
+            .await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_wallet_update_ignores_same_lt() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let (_gap_tx, mut gaps) = tokio::sync::watch::channel(0);
+        tx.send_replace(Some(stream::StreamUpdate {
+            address: "0:abc".to_owned(),
+            max_lt: 9,
+        }));
+
+        assert_eq!(
+            wait_for_wallet_update(
+                || async { Ok(false) },
+                &mut rx,
+                &mut gaps,
+                9,
+                Duration::from_millis(20),
+            )
+            .await,
+            Err(WaitForUpdateError::TimedOut)
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_wallet_update_times_out_once_per_attempt() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(None);
+        let (_gap_tx, mut gaps) = tokio::sync::watch::channel(0);
+
+        assert_eq!(
+            wait_for_wallet_update(
+                || async { Ok(false) },
+                &mut rx,
+                &mut gaps,
+                9,
+                Duration::from_millis(20),
+            )
+            .await,
+            Err(WaitForUpdateError::TimedOut)
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_wallet_update_reconciles_after_gap() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(None);
+        let (gap_tx, mut gaps) = tokio::sync::watch::channel(0);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            gap_tx.send_replace(1);
+        });
+
+        assert_eq!(
+            wait_for_wallet_update(
+                || async { Ok(true) },
+                &mut rx,
+                &mut gaps,
+                9,
+                Duration::from_secs(1),
+            )
+            .await,
+            Ok(())
+        );
     }
 }

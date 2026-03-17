@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,19 +9,16 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sse_stream::SseStream;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use url::Url;
 
 use everscale_rpc_client::{RpcClient, RpcRequest, RpcResponse};
-use nekoton_abi::GenTimings;
 use ton_block::MsgAddressInt;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamUpdate {
     pub address: String,
     pub max_lt: u64,
-    pub gen_utime: u32,
-    pub dropped: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +27,13 @@ struct UpdatePayload {
     address: String,
     max_lt: u64,
     gen_utime: u32,
+    #[serde(default)]
+    dropped: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeepAlivePayload {
     #[serde(default)]
     dropped: Option<u64>,
 }
@@ -60,8 +65,16 @@ struct JsonRpcError {
     message: String,
 }
 
+struct StreamEvent {
+    name: String,
+    data: String,
+}
+
 pub(crate) struct StreamHandle {
-    updates_tx: broadcast::Sender<StreamUpdate>,
+    updates: DashMap<String, watch::Sender<Option<StreamUpdate>>>,
+    gaps: watch::Sender<u64>,
+    gap_epoch: AtomicU64,
+    last_dropped: AtomicU64,
     uuid: RwLock<String>,
     uuid_notify: Notify,
     subscribed: DashSet<String>,
@@ -153,6 +166,8 @@ pub(crate) fn global() -> Result<Arc<StreamHandle>> {
 }
 
 impl StreamHandle {
+    const LOCAL_EVENT_QUEUE_CAPACITY: usize = 256;
+
     fn new(
         endpoints: Vec<Url>,
         poll: Option<Arc<PollState>>,
@@ -175,9 +190,12 @@ impl StreamHandle {
         };
         stream.set_path(&stream_path);
         let http = reqwest::Client::builder().build()?;
-        let (updates_tx, _) = broadcast::channel(1024);
+        let (gaps, _) = watch::channel(0);
         let handle = Arc::new(Self {
-            updates_tx,
+            updates: DashMap::new(),
+            gaps,
+            gap_epoch: AtomicU64::new(0),
+            last_dropped: AtomicU64::new(0),
             uuid: RwLock::new(String::new()),
             uuid_notify: Notify::new(),
             subscribed: DashSet::new(),
@@ -203,7 +221,10 @@ impl StreamHandle {
         Ok(handle)
     }
 
-    pub async fn subscribe_addr(&self, addr: &str) -> Result<broadcast::Receiver<StreamUpdate>> {
+    pub async fn subscribe_addr(
+        &self,
+        addr: &str,
+    ) -> Result<watch::Receiver<Option<StreamUpdate>>> {
         if self.streaming {
             self.ensure_subscribed(addr).await?;
         } else if let Some(poll) = self.poll.as_ref() {
@@ -219,10 +240,36 @@ impl StreamHandle {
                 );
             }
         }
-        Ok(self.updates_tx.subscribe())
+        Ok(self.wallet_updates(addr))
     }
 
-    //todo add unsubscribe, not needed with a single addr
+    pub fn subscribe_gaps(&self) -> watch::Receiver<u64> {
+        self.gaps.subscribe()
+    }
+
+    pub fn release_addr(&self, addr: &str) {
+        let Some(updates) = self.updates.get(addr) else {
+            return;
+        };
+        if updates.receiver_count() > 0 {
+            return;
+        }
+        drop(updates);
+
+        let remove_entry = self
+            .updates
+            .get(addr)
+            .is_some_and(|updates| updates.receiver_count() == 0);
+        if !remove_entry {
+            return;
+        }
+
+        self.updates.remove(addr);
+        self.subscribed.remove(addr);
+        if let Some(poll) = self.poll.as_ref() {
+            poll.entries.remove(addr);
+        }
+    }
 
     async fn ensure_subscribed(&self, addr: &str) -> Result<()> {
         let uuid = self.wait_for_uuid().await?;
@@ -248,6 +295,68 @@ impl StreamHandle {
             }
             self.uuid_notify.notified().await;
         }
+    }
+
+    fn wallet_updates(&self, addr: &str) -> watch::Receiver<Option<StreamUpdate>> {
+        match self.updates.entry(addr.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().subscribe(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (updates, rx) = watch::channel(None);
+                entry.insert(updates);
+                rx
+            }
+        }
+    }
+
+    fn publish_update(&self, update: StreamUpdate) {
+        let addr = update.address.clone();
+        let tracked = self.updates.contains_key(&addr)
+            || self.subscribed.contains(&addr)
+            || self
+                .poll
+                .as_ref()
+                .is_some_and(|poll| poll.entries.contains_key(&addr));
+        if !tracked {
+            return;
+        }
+        match self.updates.entry(addr) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let _ = entry.get_mut().send_replace(Some(update));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (updates, _) = watch::channel(Some(update));
+                entry.insert(updates);
+            }
+        }
+    }
+
+    fn note_gap(&self) {
+        let next = self.gap_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.gaps.send_replace(next);
+    }
+
+    fn note_dropped(&self, dropped: Option<u64>) -> bool {
+        let Some(dropped) = dropped else {
+            return false;
+        };
+
+        let mut prev = self.last_dropped.load(Ordering::Relaxed);
+        while dropped > prev {
+            match self.last_dropped.compare_exchange_weak(
+                prev,
+                dropped,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.note_gap();
+                    return true;
+                }
+                Err(actual) => prev = actual,
+            }
+        }
+
+        false
     }
 
     async fn resubscribe_all(&self, uuid: &str) -> Result<()> {
@@ -304,6 +413,8 @@ impl StreamHandle {
         loop {
             if let Err(err) = self.run_once().await {
                 log::warn!("stream error: {err}");
+                self.last_dropped.store(0, Ordering::Relaxed);
+                self.note_gap();
                 self.uuid.write().clear();
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -337,18 +448,8 @@ impl StreamHandle {
                             },
                         );
 
-                        let gen_utime = match state.timings {
-                            GenTimings::Known { gen_utime, .. } => gen_utime,
-                            GenTimings::Unknown => 0,
-                        };
-
-                        let update = StreamUpdate {
-                            address,
-                            max_lt,
-                            gen_utime,
-                            dropped: None,
-                        };
-                        let _ = self.updates_tx.send(update);
+                        let update = StreamUpdate { address, max_lt };
+                        self.publish_update(update);
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -373,17 +474,34 @@ impl StreamHandle {
             return Err(anyhow::anyhow!("stream status {}", response.status()));
         }
 
+        let (tx, mut rx) = mpsc::channel(Self::LOCAL_EVENT_QUEUE_CAPACITY);
         let mut sse_stream = SseStream::from_byte_stream(response.bytes_stream());
-        while let Some(sse) = sse_stream.next().await {
-            let sse = sse?;
-            let Some(name) = sse.event else {
-                continue;
-            };
-            let Some(data) = sse.data else {
-                continue;
-            };
-            self.handle_event(&name, &data).await?;
-        }
+        let read_events = async {
+            while let Some(sse) = sse_stream.next().await {
+                let sse = sse?;
+                let Some(name) = sse.event else {
+                    continue;
+                };
+                let Some(data) = sse.data else {
+                    continue;
+                };
+                tx.send(StreamEvent { name, data })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("local stream event queue closed"))?;
+            }
+            Result::<()>::Ok(())
+        };
+
+        let consume_events = async {
+            while let Some(event) = rx.recv().await {
+                self.handle_event(&event.name, &event.data).await?;
+            }
+            Result::<()>::Ok(())
+        };
+
+        let (read_result, consume_result) = tokio::join!(read_events, consume_events);
+        read_result?;
+        consume_result?;
 
         Err(anyhow::anyhow!("stream ended"))
     }
@@ -392,12 +510,28 @@ impl StreamHandle {
         match name {
             "uuid" => {
                 log::info!("Stream event uuid: {data}");
+                self.last_dropped.store(0, Ordering::Relaxed);
                 *self.uuid.write() = data.to_owned();
                 self.uuid_notify.notify_waiters();
                 self.resubscribe_all(data).await?;
             }
+            "keep-alive" => {
+                let payload: KeepAlivePayload = serde_json::from_str(data)?;
+                if self.note_dropped(payload.dropped) {
+                    log::warn!(
+                        "Stream keep-alive reported dropped updates: {:?}",
+                        payload.dropped
+                    );
+                }
+            }
             "update" => {
                 let payload: UpdatePayload = serde_json::from_str(data)?;
+                if self.note_dropped(payload.dropped) {
+                    log::warn!(
+                        "Stream update reported dropped updates: {:?}",
+                        payload.dropped
+                    );
+                }
                 log::info!(
                     "Stream event update address={} max_lt={} gen_utime={} dropped={:?}",
                     payload.address,
@@ -408,13 +542,108 @@ impl StreamHandle {
                 let update = StreamUpdate {
                     address: payload.address,
                     max_lt: payload.max_lt,
-                    gen_utime: payload.gen_utime,
-                    dropped: payload.dropped,
                 };
-                let _ = self.updates_tx.send(update);
+                self.publish_update(update);
             }
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_handle() -> Arc<StreamHandle> {
+        StreamHandle::new(
+            vec![Url::parse("http://127.0.0.1/rpc").unwrap()],
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn subscribe_addr_is_wallet_scoped() {
+        let handle = test_handle();
+        let mut left = handle.subscribe_addr("0:left").await.unwrap();
+        let right = handle.subscribe_addr("0:right").await.unwrap();
+        let _ = left.borrow_and_update();
+
+        handle.publish_update(StreamUpdate {
+            address: "0:left".to_owned(),
+            max_lt: 11,
+        });
+
+        left.changed().await.unwrap();
+        assert_eq!(left.borrow().as_ref().unwrap().max_lt, 11);
+        assert!(!right.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_sees_latest_wallet_update() {
+        let handle = test_handle();
+        handle.subscribed.insert("0:late".to_owned());
+        handle.publish_update(StreamUpdate {
+            address: "0:late".to_owned(),
+            max_lt: 33,
+        });
+
+        let updates = handle.subscribe_addr("0:late").await.unwrap();
+        let update = updates.borrow().clone().unwrap();
+        assert_eq!(update.max_lt, 33);
+    }
+
+    #[tokio::test]
+    async fn release_addr_cleans_up_last_receiver() {
+        let handle = test_handle();
+        let updates = handle.subscribe_addr("0:gone").await.unwrap();
+        assert!(handle.updates.contains_key("0:gone"));
+        drop(updates);
+
+        handle.release_addr("0:gone");
+
+        assert!(!handle.updates.contains_key("0:gone"));
+        assert!(handle
+            .poll
+            .as_ref()
+            .is_none_or(|poll| !poll.entries.contains_key("0:gone")));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_drop_advances_gap_epoch_once_per_new_counter() {
+        let handle = test_handle();
+        let mut gaps = handle.subscribe_gaps();
+        let _ = gaps.borrow_and_update();
+
+        handle
+            .handle_event(
+                "keep-alive",
+                r#"{"lt":"1","utime":2,"seqno":3,"dropped":4}"#,
+            )
+            .await
+            .unwrap();
+        gaps.changed().await.unwrap();
+        assert_eq!(*gaps.borrow_and_update(), 1);
+
+        handle
+            .handle_event(
+                "keep-alive",
+                r#"{"lt":"2","utime":3,"seqno":4,"dropped":4}"#,
+            )
+            .await
+            .unwrap();
+        assert!(!gaps.has_changed().unwrap());
+
+        handle
+            .handle_event(
+                "keep-alive",
+                r#"{"lt":"3","utime":4,"seqno":5,"dropped":5}"#,
+            )
+            .await
+            .unwrap();
+        gaps.changed().await.unwrap();
+        assert_eq!(*gaps.borrow_and_update(), 2);
     }
 }
