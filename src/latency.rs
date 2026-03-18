@@ -6,6 +6,7 @@ use crate::models::GenericDeploymentInfo;
 use crate::stream;
 use crate::{send, Args};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwapOption;
 use chrono::Utc;
 use clap::Parser;
 use ed25519_dalek::Keypair;
@@ -15,9 +16,12 @@ use nekoton_utils::SimpleClock;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
-use ton_block::MsgAddressInt;
+use ton_block::{AccountStuff, MsgAddressInt};
 use ton_types::UInt256;
 
 #[derive(Parser, Debug, Clone)]
@@ -62,6 +66,72 @@ pub struct LatencyTestArgs {
     time_window: Option<u64>,
 }
 
+const PREPARE_LEAD: Duration = Duration::from_millis(100);
+
+fn should_prepare_message(now: SystemTime, next_send_time: SystemTime) -> bool {
+    next_send_time.duration_since(now).unwrap_or(Duration::ZERO) <= PREPARE_LEAD
+}
+
+#[derive(Clone, Copy)]
+enum WalletSchedule {
+    SlotStep { step_ms: u64, window_ms: u64 },
+    FixedPhase { phase_ms: u64, window_ms: u64 },
+}
+
+impl WalletSchedule {
+    fn next_send_time(self, slot_index: u64, now: SystemTime) -> Result<SystemTime> {
+        match self {
+            Self::SlotStep { step_ms, window_ms } => next_slot_time(
+                now,
+                step_ms,
+                usize::try_from(slot_index).unwrap(),
+                window_ms,
+            ),
+            Self::FixedPhase {
+                phase_ms,
+                window_ms,
+            } => next_fixed_phase_time(now, phase_ms, window_ms),
+        }
+    }
+}
+
+struct PreparedMessage {
+    slot_index: u64,
+    message: ton_block::Message,
+}
+
+struct WalletSignerState {
+    desired_slot: AtomicU64,
+    prepared: ArcSwapOption<PreparedMessage>,
+    current_lt: AtomicU64,
+}
+
+impl WalletSignerState {
+    fn new(initial_lt: u64) -> Self {
+        Self {
+            desired_slot: AtomicU64::new(0),
+            prepared: ArcSwapOption::from(None),
+            current_lt: AtomicU64::new(initial_lt),
+        }
+    }
+}
+
+struct SignerWorker {
+    wallet_index: usize,
+    sender: MsgAddressInt,
+    receiver: MsgAddressInt,
+    amount: u64,
+    schedule: WalletSchedule,
+    slot_limit: u64,
+    cached_account: Arc<AccountStuff>,
+    state: Arc<WalletSignerState>,
+}
+
+struct SendAttemptOutcome {
+    completion: TxCompletion,
+    next_prev_lt: u64,
+}
+
 pub(crate) async fn run(
     latency_args: LatencyTestArgs,
     common_args: Args,
@@ -83,6 +153,8 @@ pub(crate) async fn run(
     )
     .await?;
 
+    let sign_id = send::resolve_sign_id(&client).await?;
+
     let deployments_path = deployments_path(&common_args)?;
     log::info!("Using deployments path: {:?}", deployments_path);
 
@@ -92,6 +164,7 @@ pub(crate) async fn run(
             keypair,
             client,
             &deployments_path,
+            sign_id,
             COST_PER_TRANSACTION,
             window_ms,
         )
@@ -102,6 +175,7 @@ pub(crate) async fn run(
             keypair,
             client,
             &deployments_path,
+            sign_id,
             COST_PER_TRANSACTION,
             window_ms,
         )
@@ -114,6 +188,7 @@ async fn run_single_wallet(
     keypair: &Keypair,
     client: RpcClient,
     deployments_path: &Path,
+    sign_id: Option<i32>,
     cost_per_transaction: u64,
     window_ms: u64,
 ) -> Result<()> {
@@ -144,20 +219,51 @@ async fn run_single_wallet(
     let receiver = zero_address()?;
     let (events_tx, collector) = spawn_collector(&latency_args)?;
     let should_log = latency_args.log_file.is_some();
+    let cached_account = Arc::new(fetch_cached_wallet_state(&client, &sender).await?);
+    let signer_state = Arc::new(WalletSignerState::new(cached_account.storage.last_trans_lt));
+    let signer_thread = spawn_signer_thread(
+        vec![SignerWorker {
+            wallet_index: 0,
+            sender: sender.clone(),
+            receiver: receiver.clone(),
+            amount: latency_args.amount,
+            schedule: WalletSchedule::SlotStep { step_ms, window_ms },
+            slot_limit: requested_txs as u64,
+            cached_account: cached_account.clone(),
+            state: signer_state.clone(),
+        }],
+        sign_id,
+        clone_keypair(keypair)?,
+    )?;
 
     for slot_index in 0..requested_txs {
         sleep_until_slot(step_ms, slot_index, window_ms).await?;
-        let outcome = send_test_transaction(
-            &client,
-            keypair,
-            &sender,
-            &receiver,
-            latency_args.amount,
-            should_log,
-        )
-        .await;
-        send_collector_event(&events_tx, outcome)?;
+        let outcome = match take_prepared_message(&signer_state, slot_index as u64) {
+            Some(prepared) => {
+                let prev_lt = signer_state.current_lt.load(Ordering::Acquire);
+                send_prepared_transaction(&client, &sender, prepared.message, should_log, prev_lt)
+                    .await
+            }
+            None => SendAttemptOutcome {
+                completion: TxCompletion::PrepMiss {
+                    wallet_index: 0,
+                    slot_index,
+                },
+                next_prev_lt: signer_state.current_lt.load(Ordering::Acquire),
+            },
+        };
+        signer_state
+            .current_lt
+            .store(outcome.next_prev_lt, Ordering::Release);
+        send_collector_event(&events_tx, outcome.completion)?;
+        signer_state
+            .desired_slot
+            .store(slot_index as u64 + 1, Ordering::Release);
     }
+    signer_state
+        .desired_slot
+        .store(requested_txs as u64, Ordering::Release);
+    join_signer_thread(signer_thread)?;
 
     drop(events_tx);
     let results = collector
@@ -173,6 +279,7 @@ async fn run_multi_wallet(
     keypair: &Keypair,
     client: RpcClient,
     deployments_path: &Path,
+    sign_id: Option<i32>,
     cost_per_transaction: u64,
     window_ms: u64,
 ) -> Result<()> {
@@ -200,10 +307,12 @@ async fn run_multi_wallet(
     let receiver = zero_address()?;
     let (events_tx, collector) = spawn_collector(&latency_args)?;
     let should_log = latency_args.log_file.is_some();
+    let mut signer_workers = Vec::with_capacity(wallet_count);
     let mut handles = Vec::with_capacity(wallet_count);
 
     for ((sender, phase_ms), wallet_index) in senders.into_iter().zip(phases_ms).zip(0usize..) {
-        let balance = current_balance(&client, &sender).await?;
+        let cached_account = Arc::new(fetch_cached_wallet_state(&client, &sender).await?);
+        let balance = cached_account.storage.balance.grams.as_u128();
         let max_iterations = balance / u128::from(cost_per_transaction);
         if max_iterations < per_wallet_txs as u128 {
             anyhow::bail!(
@@ -220,27 +329,60 @@ async fn run_multi_wallet(
 
         let client = client.clone();
         let sender_events = events_tx.clone();
-        let sender_receiver = receiver.clone();
-        let sender_keypair = Keypair::from_bytes(&keypair_bytes)
-            .map_err(|error| anyhow::anyhow!("failed to clone keypair from bytes: {error}"))?;
+        let signer_state = Arc::new(WalletSignerState::new(cached_account.storage.last_trans_lt));
+        signer_workers.push(SignerWorker {
+            wallet_index,
+            sender: sender.clone(),
+            receiver: receiver.clone(),
+            amount,
+            schedule: WalletSchedule::FixedPhase {
+                phase_ms,
+                window_ms,
+            },
+            slot_limit: per_wallet_txs as u64,
+            cached_account: cached_account.clone(),
+            state: signer_state.clone(),
+        });
         let handle = tokio::spawn(async move {
-            for _ in 0..per_wallet_txs {
+            for slot_index in 0..per_wallet_txs {
                 sleep_until_fixed_phase(phase_ms, window_ms).await?;
-                let outcome = send_test_transaction(
-                    &client,
-                    &sender_keypair,
-                    &sender,
-                    &sender_receiver,
-                    amount,
-                    should_log,
-                )
-                .await;
-                send_collector_event(&sender_events, outcome)?;
+                let outcome = match take_prepared_message(&signer_state, slot_index as u64) {
+                    Some(prepared) => {
+                        let prev_lt = signer_state.current_lt.load(Ordering::Acquire);
+                        send_prepared_transaction(
+                            &client,
+                            &sender,
+                            prepared.message,
+                            should_log,
+                            prev_lt,
+                        )
+                        .await
+                    }
+                    None => SendAttemptOutcome {
+                        completion: TxCompletion::PrepMiss {
+                            wallet_index,
+                            slot_index,
+                        },
+                        next_prev_lt: signer_state.current_lt.load(Ordering::Acquire),
+                    },
+                };
+                signer_state
+                    .current_lt
+                    .store(outcome.next_prev_lt, Ordering::Release);
+                send_collector_event(&sender_events, outcome.completion)?;
+                signer_state
+                    .desired_slot
+                    .store(slot_index as u64 + 1, Ordering::Release);
             }
             Result::<()>::Ok(())
         });
         handles.push(handle);
     }
+    let signer_thread = spawn_signer_thread(
+        signer_workers,
+        sign_id,
+        clone_keypair_from_bytes(&keypair_bytes)?,
+    )?;
 
     drop(events_tx);
     for handle in handles {
@@ -248,6 +390,7 @@ async fn run_multi_wallet(
             .await
             .map_err(|error| anyhow::anyhow!("latency worker panicked: {error}"))??;
     }
+    join_signer_thread(signer_thread)?;
 
     let results = collector
         .await
@@ -462,6 +605,10 @@ struct LogRecord {
 }
 
 enum TxCompletion {
+    PrepMiss {
+        wallet_index: usize,
+        slot_index: usize,
+    },
     Confirmed {
         started_at: SystemTime,
         latency: Duration,
@@ -484,7 +631,9 @@ enum WaitForUpdateError {
 struct CollectedResults {
     latencies: Vec<Duration>,
     timestamped_latencies: Vec<plotting::TimestampedLatency>,
+    scheduled_count: usize,
     sent_count: usize,
+    prep_miss_count: usize,
     confirmed_count: usize,
     failed_count: usize,
     timed_out_count: usize,
@@ -517,20 +666,30 @@ fn spawn_collector(
         let mut results = CollectedResults {
             latencies: Vec::new(),
             timestamped_latencies: Vec::new(),
+            scheduled_count: 0,
             sent_count: 0,
+            prep_miss_count: 0,
             confirmed_count: 0,
             failed_count: 0,
             timed_out_count: 0,
         };
 
         while let Some(outcome) = rx.recv().await {
-            results.sent_count += 1;
+            results.scheduled_count += 1;
             match outcome {
+                TxCompletion::PrepMiss {
+                    wallet_index,
+                    slot_index,
+                } => {
+                    results.prep_miss_count += 1;
+                    log::warn!("Latency prep miss: wallet={wallet_index} slot={slot_index}");
+                }
                 TxCompletion::Confirmed {
                     started_at,
                     latency,
                     log_record,
                 } => {
+                    results.sent_count += 1;
                     results.latencies.push(latency);
                     results
                         .timestamped_latencies
@@ -552,6 +711,7 @@ fn spawn_collector(
                     timed_out,
                     log_record,
                 } => {
+                    results.sent_count += 1;
                     if timed_out {
                         results.timed_out_count += 1;
                     } else {
@@ -616,7 +776,9 @@ fn report_results(mut results: CollectedResults, latency_args: &LatencyTestArgs)
         let max = results.latencies[results.latencies.len() - 1];
 
         log::info!("Latency test results:");
+        log::info!("Scheduled slots: {}", results.scheduled_count);
         log::info!("Sent transactions: {}", results.sent_count);
+        log::info!("Prep misses: {}", results.prep_miss_count);
         log::info!("Confirmed transactions: {}", results.confirmed_count);
         log::info!("Failed transactions: {}", results.failed_count);
         log::info!("Timed out transactions: {}", results.timed_out_count);
@@ -651,7 +813,9 @@ fn report_results(mut results: CollectedResults, latency_args: &LatencyTestArgs)
         }
     } else {
         log::info!("Latency test results:");
+        log::info!("Scheduled slots: {}", results.scheduled_count);
         log::info!("Sent transactions: {}", results.sent_count);
+        log::info!("Prep misses: {}", results.prep_miss_count);
         log::info!("Confirmed transactions: {}", results.confirmed_count);
         log::info!("Failed transactions: {}", results.failed_count);
         log::info!("Timed out transactions: {}", results.timed_out_count);
@@ -732,19 +896,17 @@ async fn wait_for_wallet_update<F, Fut>(
     gaps: &mut tokio::sync::watch::Receiver<u64>,
     prev_lt: u64,
     timeout: Duration,
-) -> std::result::Result<(), WaitForUpdateError>
+) -> std::result::Result<u64, WaitForUpdateError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<bool>>,
+    Fut: std::future::Future<Output = Result<Option<u64>>>,
 {
     tokio::time::timeout(timeout, async {
         loop {
-            if updates
-                .borrow_and_update()
-                .as_ref()
-                .is_some_and(|update| update.max_lt > prev_lt)
-            {
-                return Ok(());
+            if let Some(update) = updates.borrow_and_update().as_ref() {
+                if update.max_lt > prev_lt {
+                    return Ok(update.max_lt);
+                }
             }
 
             tokio::select! {
@@ -754,11 +916,11 @@ where
                 changed = gaps.changed() => {
                     changed.map_err(|_| WaitForUpdateError::Closed)?;
                     let _ = gaps.borrow_and_update();
-                    if reconcile()
+                    if let Some(next_lt) = reconcile()
                         .await
                         .map_err(|_| WaitForUpdateError::Reconcile)?
                     {
-                        return Ok(());
+                        return Ok(next_lt);
                     }
                 }
             }
@@ -772,64 +934,49 @@ async fn reconcile_wallet_update(
     client: &RpcClient,
     sender: &MsgAddressInt,
     prev_lt: u64,
-) -> Result<bool> {
+) -> Result<Option<u64>> {
     let state = client
         .get_contract_state(sender, None)
         .await?
         .context("sender state not found during reconciliation")?;
-    Ok(state.account.storage.last_trans_lt > prev_lt)
+    let next_lt = state.account.storage.last_trans_lt;
+    Ok((next_lt > prev_lt).then_some(next_lt))
 }
 
-async fn send_test_transaction(
+async fn send_prepared_transaction(
     client: &RpcClient,
-    keypair: &Keypair,
     sender: &MsgAddressInt,
-    receiver: &MsgAddressInt,
-    amount: u64,
+    message: ton_block::Message,
     should_log: bool,
-) -> TxCompletion {
+    prev_lt: u64,
+) -> SendAttemptOutcome {
     let started_at = SystemTime::now();
     let start = Instant::now();
-    let payload = ton_types::BuilderData::new();
-    let state = match client.get_contract_state(sender, None).await {
-        Ok(Some(state)) => state,
-        Ok(None) => {
-            return TxCompletion::Failed {
-                error: "sender state not found".to_owned(),
-                timed_out: false,
-                log_record: None,
-            };
-        }
-        Err(error) => {
-            return TxCompletion::Failed {
-                error: error.to_string(),
-                timed_out: false,
-                log_record: None,
-            };
-        }
-    };
-    let balance = state.account.storage.balance.grams.as_u128();
-    log::info!("Sender balance: {}", balance);
-    let prev_lt = state.account.storage.last_trans_lt;
     let sender = sender.clone();
     let address = sender.to_string();
     let stream = match stream::global() {
         Ok(stream) => stream,
         Err(error) => {
-            return TxCompletion::Failed {
-                error: error.to_string(),
-                timed_out: false,
-                log_record: None,
+            return SendAttemptOutcome {
+                completion: TxCompletion::Failed {
+                    error: error.to_string(),
+                    timed_out: false,
+                    log_record: None,
+                },
+                next_prev_lt: prev_lt,
             };
         }
     };
     let mut updates = match stream.subscribe_addr(&address).await {
         Ok(updates) => updates,
         Err(error) => {
-            return TxCompletion::Failed {
-                error: error.to_string(),
-                timed_out: false,
-                log_record: None,
+            return SendAttemptOutcome {
+                completion: TxCompletion::Failed {
+                    error: error.to_string(),
+                    timed_out: false,
+                    log_record: None,
+                },
+                next_prev_lt: prev_lt,
             };
         }
     };
@@ -837,52 +984,34 @@ async fn send_test_transaction(
     let mut gaps = stream.subscribe_gaps();
     let _ = gaps.borrow_and_update();
 
-    let outcome = send::send(
-        client,
-        keypair,
-        sender.clone(),
-        payload,
-        receiver.clone(),
-        amount,
-        &state.account,
-    )
-    .await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            drop(updates);
-            drop(gaps);
-            stream.release_addr(&address);
-            return TxCompletion::Failed {
-                error: error.to_string(),
-                timed_out: false,
-                log_record: None,
-            };
-        }
-    };
-
-    let log_data = match build_log_data(should_log, &outcome.message) {
+    let log_data = match build_log_data(should_log, &message) {
         Ok(log_data) => log_data,
         Err(error) => {
             drop(updates);
             drop(gaps);
             stream.release_addr(&address);
-            return TxCompletion::Failed {
-                error: error.to_string(),
-                timed_out: false,
-                log_record: None,
+            return SendAttemptOutcome {
+                completion: TxCompletion::Failed {
+                    error: error.to_string(),
+                    timed_out: false,
+                    log_record: None,
+                },
+                next_prev_lt: prev_lt,
             };
         }
     };
 
-    if let Err(error) = outcome.broadcast_result {
+    if let Err(error) = send::broadcast_prepared_message(client, message).await {
         drop(updates);
         drop(gaps);
         stream.release_addr(&address);
-        return TxCompletion::Failed {
-            error: error.to_string(),
-            timed_out: false,
-            log_record: log_data.map(|data| LogRecord { data, lost: true }),
+        return SendAttemptOutcome {
+            completion: TxCompletion::Failed {
+                error: error.to_string(),
+                timed_out: false,
+                log_record: log_data.map(|data| LogRecord { data, lost: true }),
+            },
+            next_prev_lt: prev_lt,
         };
     }
 
@@ -895,29 +1024,41 @@ async fn send_test_transaction(
     )
     .await
     {
-        Ok(()) => TxCompletion::Confirmed {
-            started_at,
-            latency: start.elapsed(),
-            log_record: log_data.map(|data| LogRecord { data, lost: false }),
+        Ok(next_lt) => SendAttemptOutcome {
+            completion: TxCompletion::Confirmed {
+                started_at,
+                latency: start.elapsed(),
+                log_record: log_data.map(|data| LogRecord { data, lost: false }),
+            },
+            next_prev_lt: next_lt,
         },
-        Err(WaitForUpdateError::Closed) => TxCompletion::Failed {
-            error: "stream updates channel closed".to_owned(),
-            timed_out: false,
-            log_record: log_data.map(|data| LogRecord { data, lost: true }),
+        Err(WaitForUpdateError::Closed) => SendAttemptOutcome {
+            completion: TxCompletion::Failed {
+                error: "stream updates channel closed".to_owned(),
+                timed_out: false,
+                log_record: log_data.map(|data| LogRecord { data, lost: true }),
+            },
+            next_prev_lt: prev_lt,
         },
-        Err(WaitForUpdateError::Reconcile) => TxCompletion::Failed {
-            error: "stream gap reconciliation failed".to_owned(),
-            timed_out: false,
-            log_record: log_data.map(|data| LogRecord { data, lost: true }),
+        Err(WaitForUpdateError::Reconcile) => SendAttemptOutcome {
+            completion: TxCompletion::Failed {
+                error: "stream gap reconciliation failed".to_owned(),
+                timed_out: false,
+                log_record: log_data.map(|data| LogRecord { data, lost: true }),
+            },
+            next_prev_lt: prev_lt,
         },
         Err(WaitForUpdateError::TimedOut) => {
             match reconcile_wallet_update(client, &sender, prev_lt).await {
-                Ok(true) => TxCompletion::Confirmed {
-                    started_at,
-                    latency: start.elapsed(),
-                    log_record: log_data.map(|data| LogRecord { data, lost: false }),
+                Ok(Some(next_lt)) => SendAttemptOutcome {
+                    completion: TxCompletion::Confirmed {
+                        started_at,
+                        latency: start.elapsed(),
+                        log_record: log_data.map(|data| LogRecord { data, lost: false }),
+                    },
+                    next_prev_lt: next_lt,
                 },
-                Ok(false) => {
+                Ok(None) => {
                     // Re-query the sender only on timeout so the failure log shows whether
                     // the wallet was still funded when the stream confirmation never arrived.
                     let error = format_timeout_error(
@@ -928,16 +1069,22 @@ async fn send_test_transaction(
                             .await
                             .map_err(|error| error.to_string()),
                     );
-                    TxCompletion::Failed {
-                        error,
-                        timed_out: true,
-                        log_record: log_data.map(|data| LogRecord { data, lost: true }),
+                    SendAttemptOutcome {
+                        completion: TxCompletion::Failed {
+                            error,
+                            timed_out: true,
+                            log_record: log_data.map(|data| LogRecord { data, lost: true }),
+                        },
+                        next_prev_lt: prev_lt,
                     }
                 }
-                Err(error) => TxCompletion::Failed {
-                    error: format!("failed to reconcile wallet update after timeout: {error}"),
-                    timed_out: false,
-                    log_record: log_data.map(|data| LogRecord { data, lost: true }),
+                Err(error) => SendAttemptOutcome {
+                    completion: TxCompletion::Failed {
+                        error: format!("failed to reconcile wallet update after timeout: {error}"),
+                        timed_out: false,
+                        log_record: log_data.map(|data| LogRecord { data, lost: true }),
+                    },
+                    next_prev_lt: prev_lt,
                 },
             }
         }
@@ -946,6 +1093,117 @@ async fn send_test_transaction(
     drop(gaps);
     stream.release_addr(&address);
     outcome
+}
+
+fn take_prepared_message(
+    signer_state: &WalletSignerState,
+    slot_index: u64,
+) -> Option<PreparedMessage> {
+    let prepared = signer_state.prepared.swap(None)?;
+    if prepared.slot_index == slot_index {
+        Arc::try_unwrap(prepared).ok()
+    } else {
+        None
+    }
+}
+
+async fn fetch_cached_wallet_state(
+    client: &RpcClient,
+    sender: &MsgAddressInt,
+) -> Result<AccountStuff> {
+    Ok(client
+        .get_contract_state(sender, None)
+        .await?
+        .context("sender state not found")?
+        .account)
+}
+
+fn clone_keypair(keypair: &Keypair) -> Result<Keypair> {
+    clone_keypair_from_bytes(&keypair.to_bytes())
+}
+
+fn clone_keypair_from_bytes(keypair_bytes: &[u8; 64]) -> Result<Keypair> {
+    Keypair::from_bytes(keypair_bytes)
+        .map_err(|error| anyhow::anyhow!("failed to clone keypair from bytes: {error}"))
+}
+
+fn spawn_signer_thread(
+    workers: Vec<SignerWorker>,
+    sign_id: Option<i32>,
+    keypair: Keypair,
+) -> Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("latency-signer".to_owned())
+        .spawn(move || loop {
+            let now = SystemTime::now();
+            let mut all_done = true;
+            for worker in &workers {
+                let desired_slot = worker.state.desired_slot.load(Ordering::Acquire);
+                if desired_slot >= worker.slot_limit {
+                    continue;
+                }
+                all_done = false;
+
+                if worker
+                    .state
+                    .prepared
+                    .load()
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.slot_index == desired_slot)
+                {
+                    continue;
+                }
+
+                let Ok(next_send_time) = worker.schedule.next_send_time(desired_slot, now) else {
+                    continue;
+                };
+                if !should_prepare_message(now, next_send_time) {
+                    continue;
+                }
+
+                let payload = ton_types::BuilderData::new();
+                let message = match send::prepare_signed_message(
+                    sign_id,
+                    &keypair,
+                    worker.sender.clone(),
+                    payload,
+                    worker.receiver.clone(),
+                    worker.amount,
+                    &worker.cached_account,
+                ) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        log::warn!(
+                            "failed to prepare latency message: wallet={} slot={} error={error}",
+                            worker.wallet_index,
+                            desired_slot
+                        );
+                        continue;
+                    }
+                };
+
+                if worker.state.desired_slot.load(Ordering::Acquire) != desired_slot {
+                    continue;
+                }
+
+                worker.state.prepared.store(Some(Arc::new(PreparedMessage {
+                    slot_index: desired_slot,
+                    message,
+                })));
+            }
+
+            if all_done {
+                break;
+            }
+            thread::yield_now();
+        })
+        .map_err(Into::into)
+}
+
+fn join_signer_thread(handle: thread::JoinHandle<()>) -> Result<()> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("latency signer thread panicked"))
 }
 
 fn build_log_data(should_log: bool, message: &ton_block::Message) -> Result<Option<LogData>> {
@@ -1617,7 +1875,10 @@ with open(html_path, "w", encoding="utf-8") as handle:
             assert_eq!(row.sends[0], first);
 
             for pair in row.sends.windows(2) {
-                assert_eq!(pair[1].duration_since(pair[0]).unwrap(), Duration::from_secs(5));
+                assert_eq!(
+                    pair[1].duration_since(pair[0]).unwrap(),
+                    Duration::from_secs(5)
+                );
             }
         }
 
@@ -1629,7 +1890,11 @@ with open(html_path, "w", encoding="utf-8") as handle:
         render_wallet_schedule_animation_html(&csv_path, &html_path).unwrap();
 
         assert!(csv_path.is_file(), "missing csv artifact at {:?}", csv_path);
-        assert!(html_path.is_file(), "missing html artifact at {:?}", html_path);
+        assert!(
+            html_path.is_file(),
+            "missing html artifact at {:?}",
+            html_path
+        );
 
         let html = std::fs::read_to_string(&html_path).unwrap();
         assert!(html.contains("requestAnimationFrame"));
@@ -1654,14 +1919,14 @@ with open(html_path, "w", encoding="utf-8") as handle:
 
         assert_eq!(
             wait_for_wallet_update(
-                || async { Ok(false) },
+                || async { Ok(None) },
                 &mut rx,
                 &mut gaps,
                 9,
                 Duration::from_secs(1),
             )
             .await,
-            Ok(())
+            Ok(10)
         );
     }
 
@@ -1676,7 +1941,7 @@ with open(html_path, "w", encoding="utf-8") as handle:
 
         assert_eq!(
             wait_for_wallet_update(
-                || async { Ok(false) },
+                || async { Ok(None) },
                 &mut rx,
                 &mut gaps,
                 9,
@@ -1694,7 +1959,7 @@ with open(html_path, "w", encoding="utf-8") as handle:
 
         assert_eq!(
             wait_for_wallet_update(
-                || async { Ok(false) },
+                || async { Ok(None) },
                 &mut rx,
                 &mut gaps,
                 9,
@@ -1717,14 +1982,69 @@ with open(html_path, "w", encoding="utf-8") as handle:
 
         assert_eq!(
             wait_for_wallet_update(
-                || async { Ok(true) },
+                || async { Ok(Some(10)) },
                 &mut rx,
                 &mut gaps,
                 9,
                 Duration::from_secs(1),
             )
             .await,
-            Ok(())
+            Ok(10)
         );
+    }
+
+    #[test]
+    fn should_prepare_message_only_inside_lead_window() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        assert!(should_prepare_message(
+            now,
+            now + Duration::from_millis(100)
+        ));
+        assert!(should_prepare_message(now, now + Duration::from_millis(10)));
+        assert!(!should_prepare_message(
+            now,
+            now + Duration::from_millis(101)
+        ));
+    }
+
+    #[tokio::test]
+    async fn collector_tracks_prep_misses_outside_sent_count() {
+        let latency_args = LatencyTestArgs {
+            num_txs: 1,
+            total_wallets: 1,
+            step_ms: None,
+            window_secs: 5,
+            amount: 1,
+            csv: None,
+            log_file: None,
+            plot: None,
+            sla_threshold: None,
+            time_window: None,
+        };
+        let (tx, handle) = spawn_collector(&latency_args).unwrap();
+        send_collector_event(
+            &tx,
+            TxCompletion::PrepMiss {
+                wallet_index: 0,
+                slot_index: 0,
+            },
+        )
+        .unwrap();
+        send_collector_event(
+            &tx,
+            TxCompletion::Failed {
+                error: "boom".to_owned(),
+                timed_out: false,
+                log_record: None,
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        let results = handle.await.unwrap().unwrap();
+        assert_eq!(results.scheduled_count, 2);
+        assert_eq!(results.sent_count, 1);
+        assert_eq!(results.prep_miss_count, 1);
+        assert_eq!(results.failed_count, 1);
     }
 }

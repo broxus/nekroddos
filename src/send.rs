@@ -2,29 +2,43 @@ use ed25519_dalek::Keypair;
 use nekoton::core::ton_wallet::TransferAction;
 use nekoton::models::Expiration;
 use nekoton_utils::SimpleClock;
+use once_cell::sync::OnceCell;
 use ton_abi::sign_with_signature_id;
 use ton_block::{AccountStuff, GlobalCapabilities, MsgAddressInt};
 use ton_types::{BuilderData, SliceData};
 
 pub struct SendOutcome {
-    pub message: ton_block::Message,
     pub broadcast_result: anyhow::Result<()>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn send(
+pub async fn resolve_sign_id(
     client: &everscale_rpc_client::RpcClient,
+) -> anyhow::Result<Option<i32>> {
+    static SIGN_ID: OnceCell<Option<i32>> = OnceCell::new();
+    if let Some(sign_id) = SIGN_ID.get() {
+        return Ok(*sign_id);
+    }
+
+    let config = client.get_blockchain_config().await?;
+    let sign_id = if config.has_capability(GlobalCapabilities::CapSignatureWithId) {
+        Some(config.global_id())
+    } else {
+        None
+    };
+    let _ = SIGN_ID.set(sign_id);
+    Ok(*SIGN_ID.get().unwrap())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_signed_message(
+    sign_id: Option<i32>,
     signer: &Keypair,
     from: MsgAddressInt,
     payload: BuilderData,
     destination: MsgAddressInt,
     amount: u64,
     state: &AccountStuff,
-) -> anyhow::Result<SendOutcome> {
-    use tokio::sync::OnceCell;
-
-    static SIGN_ID: OnceCell<Option<i32>> = OnceCell::const_new();
-
+) -> anyhow::Result<ton_block::Message> {
     let gift = nekoton::core::ton_wallet::Gift {
         flags: 3,
         bounce: false,
@@ -46,33 +60,34 @@ pub async fn send(
     )?;
     let message = match message {
         TransferAction::DeployFirst => panic!("DeployFirst not supported"),
-        TransferAction::Sign(m) => m,
+        TransferAction::Sign(message) => message,
     };
 
-    let sign_id = SIGN_ID
-        .get_or_init(|| async {
-            let config = client
-                .get_blockchain_config()
-                .await
-                .expect("Failed to get blockchain config");
-            if config.has_capability(GlobalCapabilities::CapSignatureWithId) {
-                Some(config.global_id())
-            } else {
-                None
-            }
-        })
-        .await;
+    let signature = sign_with_signature_id(signer, message.hash(), sign_id);
+    Ok(message.sign(&signature.to_bytes()).unwrap().message)
+}
 
-    let signature = sign_with_signature_id(signer, message.hash(), *sign_id);
-    let signed_message = message.sign(&signature.to_bytes()).unwrap().message;
+pub async fn broadcast_prepared_message(
+    client: &everscale_rpc_client::RpcClient,
+    message: ton_block::Message,
+) -> anyhow::Result<()> {
+    client.broadcast_message(message).await.map_err(Into::into)
+}
 
-    let broadcast_result = client
-        .broadcast_message(signed_message.clone())
-        .await
-        .map_err(Into::into);
+#[allow(clippy::too_many_arguments)]
+pub async fn send(
+    client: &everscale_rpc_client::RpcClient,
+    signer: &Keypair,
+    from: MsgAddressInt,
+    payload: BuilderData,
+    destination: MsgAddressInt,
+    amount: u64,
+    state: &AccountStuff,
+) -> anyhow::Result<SendOutcome> {
+    let sign_id = resolve_sign_id(client).await?;
+    let signed_message =
+        prepare_signed_message(sign_id, signer, from, payload, destination, amount, state)?;
+    let broadcast_result = broadcast_prepared_message(client, signed_message).await;
 
-    Ok(SendOutcome {
-        message: signed_message,
-        broadcast_result,
-    })
+    Ok(SendOutcome { broadcast_result })
 }
